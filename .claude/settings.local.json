@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /home/runner/workspace log --oneline -20)",
+      "Bash(git -C /home/runner/workspace status)",
+      "Bash(pip install:*)",
+      "Bash(export:*)",
+      "Bash(python3.11:*)",
+      "Bash(python3.11 -m venv:*)",
+      "Bash(source:*)",
+      "Bash(python -c:*)",
+      "Bash(ruff check:*)",
+      "Bash(pytest:*)",
+      "Bash(playwright install:*)",
+      "Bash(gh api:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(timeout 5 uvicorn:*)"
+    ]
+  }
+}
