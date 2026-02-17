@@ -50,28 +50,34 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
     fg.language("en")
     fg.generator("The Hootline Podcast Generator")
 
+    # Channel-level image (standard RSS)
+    fg.image(
+        url=f"{settings.base_url}/static/noctua-owl.png",
+        title=settings.podcast_title,
+        link=settings.base_url,
+    )
+
     # Podcast-specific metadata
     fg.podcast.itunes_category("News", "Daily News")
-    fg.podcast.itunes_author(settings.podcast_title)
+    fg.podcast.itunes_author("Aannesha Satpati")
     fg.podcast.itunes_explicit("no")
     fg.podcast.itunes_summary(settings.podcast_description)
-    fg.podcast.itunes_owner(name=settings.podcast_title, email="aannesha.satpati@gmail.com")
-    # Placeholder image — replace with real artwork later
-    fg.podcast.itunes_image(f"{settings.base_url}/static/cover.jpg")
+    fg.podcast.itunes_owner(name="Aannesha Satpati", email="aannesha.satpati@gmail.com")
+    fg.podcast.itunes_image(f"{settings.base_url}/static/noctua-owl.png")
 
     # Add episodes (most recent first)
     for ep in sorted(episodes, key=lambda e: e["date"], reverse=True)[:MAX_FEED_EPISODES]:
         fe = fg.add_entry()
         fe.id(f"{settings.base_url}/episodes/noctua-{ep['date']}.mp3")
 
-        # Format title as "The Hootline — February 16, 2026"
+        # Format title as the date, e.g. "February 17, 2026"
         try:
             dt = datetime.strptime(ep["date"], "%Y-%m-%d")
-            display_date = dt.strftime("%B %d, %Y")
+            display_date = dt.strftime("%B %-d, %Y")
         except ValueError:
             display_date = ep["date"]
 
-        fe.title(f"{settings.podcast_title} — {display_date}")
+        fe.title(display_date)
         fe.description(ep.get("topics_summary", "Daily knowledge briefing."))
         fe.published(
             datetime.fromisoformat(ep["published"]) if "published" in ep

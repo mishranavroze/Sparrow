@@ -3,7 +3,7 @@
 import base64
 import json
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -83,18 +83,19 @@ def _get_header(headers: list[dict], name: str) -> str:
 
 
 def fetch_yesterdays_emails() -> list[EmailMessage]:
-    """Fetch yesterday's newsletter emails from Gmail.
+    """Fetch today's newsletter emails in PST (midnight PST to now).
 
-    Fetches the previous day's emails so the full day is captured.
+    The generation runs at 11:30 PM PST, so this captures the full
+    PST day's emails up to that point.
 
     Returns:
-        List of EmailMessage objects for yesterday's newsletters.
+        List of EmailMessage objects for today's newsletters (PST).
     """
     service = _get_gmail_service()
 
-    today = datetime.now(UTC).date()
-    yesterday = today - timedelta(days=1)
-    query = f"after:{yesterday.isoformat()} before:{today.isoformat()}"
+    PST = timezone(timedelta(hours=-8))
+    today_pst = datetime.now(PST).date()
+    query = f"after:{today_pst.isoformat()} before:{(today_pst + timedelta(days=1)).isoformat()}"
     if settings.gmail_label:
         query = f"label:{settings.gmail_label} {query}"
 

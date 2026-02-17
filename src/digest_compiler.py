@@ -200,9 +200,11 @@ def compile(digest: DailyDigest) -> CompiledDigest:
     if not digest.articles:
         raise DigestCompileError("No articles to compile.")
 
-    today = datetime.now(UTC)
-    date_ymd = today.strftime("%Y-%m-%d")
-    date_display = today.strftime("%B %d, %Y")
+    # Generation runs at 11:30 PM PST = 07:30 UTC next day, so the UTC
+    # date is already the next PST calendar day (e.g. Feb 17 PST -> Feb 18 UTC).
+    episode_date = datetime.now(UTC).date()
+    date_ymd = episode_date.strftime("%Y-%m-%d")
+    date_display = episode_date.strftime("%B %-d, %Y")
 
     try:
         text, segment_counts = _compile_text(digest, date_display)
