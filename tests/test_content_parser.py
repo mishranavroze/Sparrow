@@ -47,7 +47,8 @@ def test_clean_html_converts_links():
     )
     result = _clean_html(html)
     assert "this article" in result
-    assert "https://example.com" in result
+    # URLs are stripped to save space for NotebookLM's character limit
+    assert "https://example.com" not in result
 
 
 def test_clean_html_strips_hidden_elements():

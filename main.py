@@ -153,6 +153,7 @@ async def api_latest_episode():
             "date": digest["date"],
             "article_count": digest["article_count"],
             "total_words": digest["total_words"],
+            "total_chars": len(digest["markdown_text"]),
             "topics_summary": digest["topics_summary"],
             "download_url": f"/digests/{date}.md",
         }
@@ -684,7 +685,7 @@ DASHBOARD_HTML = """\
         <div class="digest-card">
           <div class="digest-info">
             <div class="digest-label">Today's Digest</div>
-            <div class="digest-stats">${d.article_count} articles &middot; ${d.total_words.toLocaleString()} words</div>
+            <div class="digest-stats">${d.article_count} articles &middot; ${d.total_words.toLocaleString()} words &middot; ${d.total_chars.toLocaleString()} chars</div>
             <div class="digest-topics">${escapeHtml(d.topics_summary || '')}</div>
           </div>
           <a class="download-btn" href="${d.download_url}" download>Download .md</a>

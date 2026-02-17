@@ -66,13 +66,10 @@ def _clean_html(html: str) -> str:
         if width in ("1", "0") or height in ("1", "0"):
             img.decompose()
 
-    # Convert links to text with URL
+    # Convert links to plain text (drop URLs to save space for NotebookLM)
     for a_tag in soup.find_all("a"):
-        href = a_tag.get("href", "")
         text = a_tag.get_text(strip=True)
-        if href and text and not href.startswith("mailto:"):
-            a_tag.replace_with(f"{text} ({href})")
-        elif text:
+        if text:
             a_tag.replace_with(text)
 
     # Get text content

@@ -10,8 +10,8 @@ from src.topic_classifier import SEGMENT_DURATIONS, SEGMENT_ORDER, Topic
 
 logger = logging.getLogger(__name__)
 
-# NotebookLM source limit (~500K characters)
-MAX_SOURCE_CHARS = 500_000
+# NotebookLM source limit (100K characters)
+MAX_SOURCE_CHARS = 100_000
 
 PODCAST_PREAMBLE = """\
 **PODCAST PRODUCTION INSTRUCTIONS:**
