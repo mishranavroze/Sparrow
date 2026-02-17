@@ -42,10 +42,52 @@ def _build_topics_summary(digest: DailyDigest, segment_counts: dict[str, int]) -
     return "; ".join(parts) if parts else "No segments"
 
 
+def _allocate_budget(articles: list[Article], budget: int) -> dict[int, int]:
+    """Allocate a character budget across articles.
+
+    Short articles keep their full content; long articles are trimmed so
+    the total fits within budget. Uses iterative redistribution: each
+    round, articles that fit under the equal share lock in their full
+    length, and the remaining budget is re-split among the rest.
+
+    Args:
+        articles: List of articles to allocate budget for.
+        budget: Total character budget for all article content.
+
+    Returns:
+        Mapping of article index to its allowed character count.
+    """
+    sizes = {i: len(a.content) for i, a in enumerate(articles)}
+    allocated: dict[int, int] = {}
+    remaining_budget = budget
+    remaining_ids = set(sizes.keys())
+
+    while remaining_ids:
+        share = remaining_budget // len(remaining_ids) if remaining_ids else 0
+        settled = set()
+        for i in remaining_ids:
+            if sizes[i] <= share:
+                allocated[i] = sizes[i]
+                remaining_budget -= sizes[i]
+                settled.add(i)
+        remaining_ids -= settled
+        # If nobody settled this round, everyone left gets the equal share
+        if not settled:
+            for i in remaining_ids:
+                allocated[i] = share
+            break
+
+    return allocated
+
+
 def _compile_text(
     digest: DailyDigest, date_str: str
 ) -> tuple[str, dict[str, int]]:
     """Compile articles into a segment-structured markdown document.
+
+    Uses budget allocation to ensure the final text fits within
+    MAX_SOURCE_CHARS. Short articles keep full text; long ones are
+    trimmed proportionally.
 
     Args:
         digest: The day's parsed articles.
@@ -60,11 +102,38 @@ def _compile_text(
         topic_key = article.topic if article.topic else Topic.OTHER.value
         grouped[topic_key].append(article)
 
+    # Collect articles in segment order and estimate per-article overhead
+    # (title line, source line, separator, joining newlines)
+    ordered_articles: list[Article] = []
+    for topic in SEGMENT_ORDER:
+        ordered_articles.extend(grouped.get(topic.value, []))
+
+    preamble = f"# Noctua Daily Briefing — {date_str}\n\n\n{PODCAST_PREAMBLE}"
+    # Estimate overhead per article: "### title\n\n*Source: name*\n\n...\n\n\n---\n"
+    per_article_overhead = 80  # conservative average for headers/separators
+    # Segment headers overhead
+    active_segments = sum(1 for t in SEGMENT_ORDER if grouped.get(t.value))
+    segment_overhead = active_segments * 60  # "## SEGMENT N: Topic (duration)\n\n"
+
+    fixed_overhead = len(preamble) + segment_overhead + (per_article_overhead * len(ordered_articles))
+    content_budget = max(MAX_SOURCE_CHARS - fixed_overhead, len(ordered_articles) * 200)
+
+    # Allocate budget across articles
+    budgets = _allocate_budget(ordered_articles, content_budget)
+    trimmed_count = sum(1 for i, a in enumerate(ordered_articles) if budgets[i] < len(a.content))
+    if trimmed_count:
+        logger.info(
+            "Budget allocation: %d/%d articles trimmed to fit %d char limit",
+            trimmed_count, len(ordered_articles), MAX_SOURCE_CHARS,
+        )
+
+    # Build the document
     sections = [f"# Noctua Daily Briefing — {date_str}\n"]
     sections.append(PODCAST_PREAMBLE)
 
     segment_counts: dict[str, int] = {}
     segment_number = 0
+    article_index = 0
 
     for topic in SEGMENT_ORDER:
         articles = grouped.get(topic.value, [])
@@ -81,25 +150,18 @@ def _compile_text(
         )
 
         for article in articles:
+            content = article.content
+            cap = budgets.get(article_index, len(content))
+            if len(content) > cap:
+                content = content[:cap].rsplit("\n", 1)[0] + "\n[...]"
+            article_index += 1
+
             sections.append(f"### {article.title}")
             sections.append(f"*Source: {article.source}*")
-            sections.append(article.content)
+            sections.append(content)
             sections.append("\n---\n")
 
     text = "\n\n".join(sections)
-
-    # Truncate if exceeding NotebookLM's source limit
-    if len(text) > MAX_SOURCE_CHARS:
-        logger.warning(
-            "Digest exceeds %d chars (%d). Truncating.",
-            MAX_SOURCE_CHARS,
-            len(text),
-        )
-        text = text[:MAX_SOURCE_CHARS]
-        # Find last complete section boundary
-        last_separator = text.rfind("\n---\n")
-        if last_separator > 0:
-            text = text[: last_separator + 5]
 
     return text, segment_counts
 
