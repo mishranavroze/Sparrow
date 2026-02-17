@@ -1,4 +1,4 @@
-modules = ["python-3.11"]
+modules = ["nodejs-20", "python-3.11"]
 run = "uvicorn main:app --host 0.0.0.0 --port 5000"
 hidden = [".config", ".git", "__pycache__", ".venv"]
 
@@ -40,3 +40,14 @@ waitForPort = 5000
 
 [workflows.workflow.metadata]
 outputType = "webview"
+
+[[workflows.workflow]]
+name = "Run tests"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python -m pytest tests/ -v"
+
+[agent]
+expertMode = true

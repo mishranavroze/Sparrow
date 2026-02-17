@@ -1,20 +1,87 @@
 """FastAPI app — serves RSS feed, audio files, and dashboard."""
 
+import asyncio
 import logging
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+from config import settings
 from src import database
-
-app = FastAPI(title="Noctua", description="Daily podcast generator")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 EPISODES_DIR = Path("output/episodes")
 FEED_PATH = Path("output/feed.xml")
+
+# --- Generation state ---
+_generation_lock = asyncio.Lock()
+_generation_running = False
+_next_scheduled_run: datetime | None = None
+
+
+def _calc_next_run() -> datetime:
+    """Calculate the next scheduled run time based on GENERATION_HOUR."""
+    now = datetime.now(UTC)
+    target = now.replace(hour=settings.generation_hour, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target
+
+
+async def _run_generation() -> None:
+    """Run the generation pipeline, guarded by a lock to prevent concurrent runs."""
+    global _generation_running
+    from generate import generate_episode
+
+    if _generation_lock.locked():
+        logger.warning("Generation already in progress, skipping.")
+        return
+
+    async with _generation_lock:
+        _generation_running = True
+        try:
+            await generate_episode()
+        except Exception as e:
+            logger.error("Generation pipeline failed: %s", e)
+        finally:
+            _generation_running = False
+
+
+async def _scheduler() -> None:
+    """Background task that triggers generation at the configured hour daily."""
+    global _next_scheduled_run
+    while True:
+        _next_scheduled_run = _calc_next_run()
+        wait_seconds = (_next_scheduled_run - datetime.now(UTC)).total_seconds()
+        logger.info(
+            "Scheduler: next generation at %s UTC (in %.0f minutes)",
+            _next_scheduled_run.strftime("%Y-%m-%d %H:%M"),
+            wait_seconds / 60,
+        )
+        await asyncio.sleep(max(wait_seconds, 0))
+        logger.info("Scheduler: triggering daily generation.")
+        await _run_generation()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start the background scheduler when the app starts."""
+    task = asyncio.create_task(_scheduler())
+    logger.info("Background scheduler started (generation_hour=%d UTC).", settings.generation_hour)
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(title="Noctua", description="Daily podcast generator", lifespan=lifespan)
 
 
 # --- Dashboard ---
@@ -117,6 +184,18 @@ async def episode(filename: str, request: Request) -> Response:
     )
 
 
+@app.post("/api/generate")
+async def api_generate():
+    """Manually trigger episode generation."""
+    if _generation_lock.locked():
+        return JSONResponse(
+            {"status": "already_running", "message": "Generation is already in progress."},
+            status_code=409,
+        )
+    asyncio.create_task(_run_generation())
+    return JSONResponse({"status": "started", "message": "Generation pipeline started."})
+
+
 @app.get("/health")
 async def health() -> dict:
     """Health check endpoint."""
@@ -128,6 +207,9 @@ async def health() -> dict:
         "episodes": episode_count,
         "digests": digest_count,
         "feed_exists": feed_exists,
+        "generation_running": _generation_running,
+        "next_scheduled_run": _next_scheduled_run.isoformat() if _next_scheduled_run else None,
+        "generation_hour_utc": settings.generation_hour,
     }
 
 
@@ -186,15 +268,32 @@ DASHBOARD_HTML = """\
     font-style: italic;
   }
 
-  header .feed-link {
+  header .header-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  header .feed-link, header .generate-btn {
     font-size: 12px;
     color: var(--accent);
     text-decoration: none;
     border: 1px solid var(--accent-dim);
     padding: 4px 12px;
     border-radius: 4px;
+    cursor: pointer;
+    background: transparent;
+    font-family: inherit;
   }
-  header .feed-link:hover { background: var(--accent-dim); color: var(--bg); }
+  header .feed-link:hover, header .generate-btn:hover { background: var(--accent-dim); color: var(--bg); }
+  header .generate-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  header .generate-btn:disabled:hover { background: transparent; color: var(--accent); }
+
+  .scheduler-info {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-align: right;
+  }
 
   .container {
     display: grid;
@@ -467,7 +566,11 @@ DASHBOARD_HTML = """\
     <h1>NOCTUA</h1>
     <div class="tagline">The owl of Minerva spreads its wings only with the falling of dusk.</div>
   </div>
-  <a class="feed-link" href="/feed.xml">RSS Feed</a>
+  <div class="header-actions">
+    <div class="scheduler-info" id="scheduler-info"></div>
+    <button class="generate-btn" id="generate-btn" onclick="triggerGenerate()">Generate Now</button>
+    <a class="feed-link" href="/feed.xml">RSS Feed</a>
+  </div>
 </header>
 
 <div class="container">
@@ -655,8 +758,50 @@ DASHBOARD_HTML = """\
       : 'var(--yellow)';
   }
 
+  async function triggerGenerate() {
+    const btn = document.getElementById('generate-btn');
+    btn.disabled = true;
+    btn.textContent = 'Starting...';
+    try {
+      const res = await fetch('/api/generate', { method: 'POST' });
+      const data = await res.json();
+      if (res.status === 409) {
+        btn.textContent = 'Running...';
+      } else {
+        btn.textContent = 'Running...';
+        switchTab('runs');
+      }
+    } catch (e) {
+      btn.textContent = 'Generate Now';
+      btn.disabled = false;
+    }
+    setTimeout(load, 2000);
+  }
+
+  async function updateHealth() {
+    try {
+      const res = await fetch('/health');
+      const h = await res.json();
+      const btn = document.getElementById('generate-btn');
+      const info = document.getElementById('scheduler-info');
+      if (h.generation_running) {
+        btn.disabled = true;
+        btn.textContent = 'Running...';
+      } else {
+        btn.disabled = false;
+        btn.textContent = 'Generate Now';
+      }
+      if (h.next_scheduled_run) {
+        const next = new Date(h.next_scheduled_run);
+        info.textContent = 'Next: ' + next.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+      }
+    } catch (e) {}
+  }
+
   load();
+  updateHealth();
   setInterval(load, 15000);
+  setInterval(updateHealth, 10000);
 </script>
 
 </body>

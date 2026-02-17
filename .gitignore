@@ -16,6 +16,7 @@ build/
 # Generated output
 output/episodes/*.mp3
 output/feed.xml
+output/noctua.db
 
 # IDE
 .vscode/

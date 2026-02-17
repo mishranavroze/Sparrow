@@ -15,7 +15,15 @@
       "Bash(gh api:*)",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "Bash(timeout 5 uvicorn:*)"
+      "Bash(timeout 5 uvicorn:*)",
+      "Bash(python scripts/gmail_auth.py:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python -m uvicorn:*)",
+      "Bash(curl:*)",
+      "Bash(python -m json.tool:*)",
+      "Bash(fuser:*)",
+      "Bash(ss -tlnp:*)",
+      "Bash(kill:*)"
     ]
   }
 }

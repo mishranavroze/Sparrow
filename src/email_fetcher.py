@@ -89,11 +89,12 @@ def fetch_todays_emails() -> list[EmailMessage]:
         List of EmailMessage objects for today's newsletters.
     """
     service = _get_gmail_service()
-    label = settings.gmail_label
 
     today = datetime.now(UTC).date()
     tomorrow = today + timedelta(days=1)
-    query = f"label:{label} after:{today.isoformat()} before:{tomorrow.isoformat()}"
+    query = f"after:{today.isoformat()} before:{tomorrow.isoformat()}"
+    if settings.gmail_label:
+        query = f"label:{settings.gmail_label} {query}"
 
     logger.info("Querying Gmail: %s", query)
 
