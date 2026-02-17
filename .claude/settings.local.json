@@ -27,7 +27,23 @@
       "Bash(env:*)",
       "Bash(test:*)",
       "Bash(python generate.py:*)",
-      "Bash(python -m playwright:*)"
+      "Bash(python -m playwright:*)",
+      "Bash(nix-env:*)",
+      "Bash(ls:*)",
+      "Bash(echo:*)",
+      "Bash(pip show:*)",
+      "Bash(python scripts/notebooklm_login.py:*)",
+      "Bash(__NEW_LINE_ce73d5aac2e99410__ python -c \"\nimport asyncio, sys\nsys.path.insert\\(0, ''.''\\)\nfrom pathlib import Path\nfrom playwright.async_api import async_playwright\nfrom config import settings\n\nNIX_CHROMIUM = ''/nix/store/kcvsxrmgwp3ffz5jijyy7wn9fcsjl4hz-playwright-browsers-1.55.0-with-cjk/chromium-1187/chrome-linux/chrome''\n\nasync def login\\(\\):\n    ud = str\\(Path\\(settings.chrome_user_data_dir\\).expanduser\\(\\)\\)\n    Path\\(ud\\).mkdir\\(parents=True, exist_ok=True\\)\n    Path\\(''output/debug''\\).mkdir\\(parents=True, exist_ok=True\\)\n\n    async with async_playwright\\(\\) as p:\n        browser = await p.chromium.launch_persistent_context\\(\n            user_data_dir=ud, executable_path=NIX_CHROMIUM, headless=True,\n            viewport={''width'': 1280, ''height'': 720},\n            args=[''--no-sandbox'',''--disable-setuid-sandbox'',''--disable-dev-shm-usage'',''--disable-gpu'',''--disable-blink-features=AutomationControlled''],\n            user_agent=''Mozilla/5.0 \\(X11; Linux x86_64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/120.0.0.0 Safari/537.36'',\n        \\)\n        page = browser.pages[0] if browser.pages else await browser.new_page\\(\\)\n        page.set_default_timeout\\(15000\\)\n\n        print\\(''1/5 Navigating to Google sign-in...''\\)\n        await page.goto\\(''https://accounts.google.com/signin'', wait_until=''networkidle'', timeout=30000\\)\n        await asyncio.sleep\\(2\\)\n\n        print\\(''2/5 Entering email...''\\)\n        e = await page.wait_for_selector\\(''input[type=\"\"email\"\"]'', timeout=10000\\)\n        await e.fill\\(settings.google_account_email\\)\n        await page.click\\(''#identifierNext''\\)\n        await asyncio.sleep\\(4\\)\n\n        print\\(''3/5 Entering password...''\\)\n        pw = await page.wait_for_selector\\(''input[type=\"\"password\"\"]'', timeout=15000\\)\n        await pw.fill\\(settings.google_account_password\\)\n        await page.click\\(''#passwordNext''\\)\n        await asyncio.sleep\\(6\\)\n\n        await page.screenshot\\(path=''output/debug/2fa-number.png''\\)\n        print\\(''4/5 2FA - CHECK YOUR PHONE! Screenshot saved to output/debug/2fa-number.png''\\)\n        sys.stdout.flush\\(\\)\n\n        # Wait up to 90s, polling every 5s\n        for i in range\\(18\\):\n            await asyncio.sleep\\(5\\)\n            url = page.url\n            if ''challenge'' not in url and ''signin/challenge'' not in url:\n                print\\(f''  Approved after {\\(i+1\\)*5}s!''\\)\n                break\n            print\\(f''  Waiting... {\\(i+1\\)*5}s''\\)\n            sys.stdout.flush\\(\\)\n        \n        await asyncio.sleep\\(3\\)\n        await page.screenshot\\(path=''output/debug/after-2fa.png''\\)\n        print\\(f''  URL after 2FA: {page.url}''\\)\n\n        print\\(''5/5 Navigating to NotebookLM...''\\)\n        await page.goto\\(''https://notebooklm.google.com'', wait_until=''networkidle'', timeout=30000\\)\n        await asyncio.sleep\\(3\\)\n        await page.screenshot\\(path=''output/debug/notebooklm-result.png''\\)\n        \n        if ''accounts.google.com'' in page.url:\n            print\\(''FAILED - still on login page''\\)\n            sys.exit\\(1\\)\n        else:\n            print\\(''SUCCESS! Logged into NotebookLM. Session saved.''\\)\n\n        await browser.close\\(\\)\n\nasyncio.run\\(login\\(\\)\\)\n\")",
+      "Bash(python3:*)",
+      "Bash(ffmpeg:*)",
+      "Bash(printenv:*)",
+      "Bash(xxd:*)",
+      "Bash(find:*)",
+      "WebFetch(domain:noctua-aanneshasatpati.replit.app)",
+      "Bash(replit deploy --help:*)",
+      "Bash(deployctl --help:*)",
+      "Bash(replit:*)",
+      "WebFetch(domain:6229f33b-21eb-4564-9877-7f8f012509a1-00-6rmk3izu0jsr.spock.replit.dev)"
     ]
   }
 }

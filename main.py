@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from config import settings
 from src import database
@@ -82,6 +83,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Noctua", description="Daily podcast generator", lifespan=lifespan)
+
+# Serve static assets (cover image, etc.)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 # --- Dashboard ---

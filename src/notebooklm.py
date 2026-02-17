@@ -23,6 +23,12 @@ ELEMENT_TIMEOUT = 10_000  # 10s
 AUDIO_GENERATION_TIMEOUT = 900  # 15 minutes in seconds
 AUDIO_POLL_INTERVAL = 15  # seconds
 
+# Nix-provided Chromium (has all required system libs)
+NIX_CHROMIUM_PATH = (
+    "/nix/store/kcvsxrmgwp3ffz5jijyy7wn9fcsjl4hz-playwright-browsers-1.55.0-with-cjk"
+    "/chromium-1187/chrome-linux/chrome"
+)
+
 
 class NotebookLMAutomator:
     """Automates NotebookLM Audio Overview generation via Playwright."""
@@ -43,8 +49,12 @@ class NotebookLMAutomator:
         Path("output/debug").mkdir(parents=True, exist_ok=True)
 
         async with async_playwright() as p:
+            # Use Nix-provided Chromium if available, fall back to default
+            executable = NIX_CHROMIUM_PATH if Path(NIX_CHROMIUM_PATH).exists() else None
+
             browser = await p.chromium.launch_persistent_context(
                 user_data_dir=user_data_dir,
+                executable_path=executable,
                 headless=True,
                 viewport={"width": 1280, "height": 720},
                 args=[
@@ -63,6 +73,9 @@ class NotebookLMAutomator:
 
                 # Step 2: Check session is valid
                 await self._check_session(page)
+
+                # Step 2.5: Dismiss any overlay dialogs
+                await self._dismiss_dialogs(page)
 
                 # Step 3: Clear previous sources (if reusing notebook)
                 await self._clear_sources(page)
@@ -139,8 +152,8 @@ class NotebookLMAutomator:
             notebook_url = "https://notebooklm.google.com"
 
         logger.info("Navigating to %s", notebook_url)
-        await page.goto(notebook_url, wait_until="networkidle", timeout=NAVIGATION_TIMEOUT)
-        await asyncio.sleep(2)
+        await page.goto(notebook_url, wait_until="domcontentloaded", timeout=60_000)
+        await asyncio.sleep(5)
 
     async def _check_session(self, page: Page) -> None:
         """Check if the Google session is still valid.
@@ -162,6 +175,37 @@ class NotebookLMAutomator:
                 )
 
         logger.info("Session is valid. Current URL: %s", current_url)
+
+    async def _dismiss_dialogs(self, page: Page) -> None:
+        """Dismiss any overlay dialogs that appear on page load."""
+        logger.info("Checking for overlay dialogs...")
+
+        # Try multiple close strategies for common NotebookLM popups
+        close_selectors = [
+            "button[aria-label='Close']",
+            ".cdk-overlay-container button[aria-label='Close']",
+            "button.close-button",
+            "mat-dialog-container button[aria-label='Close']",
+            ".cdk-overlay-backdrop",
+        ]
+
+        for selector in close_selectors:
+            try:
+                el = await page.wait_for_selector(selector, timeout=3000)
+                if el:
+                    await el.click()
+                    logger.info("Dismissed dialog via: %s", selector)
+                    await asyncio.sleep(1)
+                    break
+            except Exception:
+                continue
+
+        # Also press Escape as a fallback
+        try:
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(1)
+        except Exception:
+            pass
 
     async def _clear_sources(self, page: Page) -> None:
         """Clear all existing sources from the notebook."""
@@ -238,124 +282,128 @@ class NotebookLMAutomator:
         logger.info("Sources cleared")
 
     async def _add_text_source(self, page: Page, text: str) -> None:
-        """Add the digest text as a source via clipboard/paste.
+        """Add the digest text as a source via file upload.
+
+        Saves text to a temp file and uploads it, bypassing Angular textarea issues.
 
         Args:
             page: Playwright page.
             text: The digest text content.
         """
-        logger.info("Adding text source (%d chars)...", len(text))
+        logger.info("Adding text source (%d chars) via file upload...", len(text))
 
-        # Click "Add source" button
-        add_btn = await self._find_element(
-            page,
-            [
-                "button:has-text('Add source')",
-                "button:has-text('Add')",
-                "[aria-label='Add source']",
-                ".add-source-button",
-                "button.add-source",
-            ],
-            "add source button",
-        )
-        await add_btn.click()
-        await asyncio.sleep(1)
+        # Save digest to a temporary text file
+        import tempfile
+        tmp_file = Path(tempfile.mktemp(suffix=".txt", prefix="noctua-digest-"))
+        tmp_file.write_text(text, encoding="utf-8")
+        logger.info("Saved digest to temp file: %s (%d bytes)", tmp_file, tmp_file.stat().st_size)
 
-        # Select "Copied text" / "Text" source type
-        text_option = await self._find_element(
-            page,
-            [
-                "button:has-text('Copied text')",
-                "button:has-text('Text')",
-                "[aria-label='Copied text']",
-                "[data-source-type='text']",
-                ":text('Copied text')",
-                "div:has-text('Copied text')",
-            ],
-            "text source option",
-        )
-        await text_option.click()
-        await asyncio.sleep(1)
-
-        # Find the text input area and fill it
-        text_input = await self._find_element(
-            page,
-            [
-                "textarea",
-                "[contenteditable='true']",
-                "div[role='textbox']",
-                ".text-input textarea",
-                "input[type='text']",
-            ],
-            "text input area",
-        )
-
-        # Use fill for textarea, or evaluate for contenteditable
         try:
-            await text_input.fill(text)
-        except Exception:
+            # Dismiss any existing dialogs first
+            await self._dismiss_dialogs(page)
+
+            # Click "+ Add sources" button via JS to open the source dialog
             await page.evaluate(
-                """(args) => {
-                    const el = document.querySelector(args.selector);
-                    if (el) {
-                        el.textContent = args.text;
-                        el.dispatchEvent(new Event('input', {bubbles: true}));
-                    }
-                }""",
-                {"selector": "textarea, [contenteditable='true']", "text": text},
+                """() => {
+                    const buttons = [...document.querySelectorAll('button')];
+                    const btn = buttons.find(b =>
+                        b.textContent.includes('Add source') || b.textContent.includes('Upload a source')
+                    );
+                    if (btn) btn.click();
+                }"""
             )
+            await asyncio.sleep(3)
+            await page.screenshot(path="output/debug/add-source-dialog.png")
 
-        await asyncio.sleep(1)
+            # Click "Upload files" button using Playwright's force click
+            # (force=True bypasses overlay intercept while preserving native events)
+            logger.info("Clicking 'Upload files' with force click...")
+            async with page.expect_file_chooser(timeout=15000) as fc_info:
+                await page.locator("button:has-text('Upload files')").click(force=True)
+            file_chooser = await fc_info.value
+            await file_chooser.set_files(str(tmp_file))
+            logger.info("File uploaded via file chooser")
 
-        # Click the insert/save/submit button
-        submit_btn = await self._find_element(
-            page,
-            [
-                "button:has-text('Insert')",
-                "button:has-text('Add')",
-                "button:has-text('Save')",
-                "button:has-text('Submit')",
-                "button[type='submit']",
-            ],
-            "submit/insert button",
-        )
-        await submit_btn.click()
-        await asyncio.sleep(2)
+            await asyncio.sleep(5)
+            await page.screenshot(path="output/debug/after-upload.png")
 
-        logger.info("Text source added")
+            # Wait for source to be processed (check for source count change)
+            for i in range(12):  # Wait up to 60s
+                source_count = await page.evaluate(
+                    """() => {
+                        const el = document.querySelector('[class*="source"]');
+                        const countEl = [...document.querySelectorAll('*')].find(
+                            e => e.textContent.match(/^\\d+ source/) && e.children.length === 0
+                        );
+                        return countEl ? countEl.textContent.trim() : 'unknown';
+                    }"""
+                )
+                logger.info("Source count check %d: %s", i + 1, source_count)
+                if "1 source" in source_count or "2 source" in source_count:
+                    break
+                await asyncio.sleep(5)
+
+            await page.screenshot(path="output/debug/after-source-processing.png")
+            logger.info("Text source added via file upload")
+
+        finally:
+            # Clean up temp file
+            try:
+                tmp_file.unlink()
+            except Exception:
+                pass
 
     async def _generate_audio_overview(self, page: Page) -> None:
         """Trigger Audio Overview generation."""
         logger.info("Starting Audio Overview generation...")
 
-        # Navigate to the Audio Overview / Studio section
-        audio_tab = await self._find_element(
-            page,
-            [
-                "button:has-text('Audio Overview')",
-                "button:has-text('Notebook guide')",
-                "[aria-label='Audio Overview']",
-                "button:has-text('Generate')",
-                ".notebook-guide-button",
-            ],
-            "audio overview tab/button",
-        )
-        await audio_tab.click()
-        await asyncio.sleep(2)
+        # Dismiss any lingering overlays first
+        await self._dismiss_dialogs(page)
 
-        # Click Generate button
-        generate_btn = await self._find_element(
-            page,
-            [
-                "button:has-text('Generate')",
-                "button:has-text('Create')",
-                "button:has-text('Generate audio')",
-                "[aria-label='Generate']",
-                "button:has-text('Deep Dive')",
-            ],
-            "generate audio button",
+        await page.screenshot(path="output/debug/before-audio-gen.png")
+
+        # Use JS clicks to bypass any remaining overlays
+        # Step 1: Click Audio Overview in the Studio panel
+        clicked = await page.evaluate(
+            """() => {
+                // Look for Audio Overview button/link in the Studio panel
+                const allButtons = [...document.querySelectorAll('button, [role="tab"], [role="button"], a')];
+                const audioBtn = allButtons.find(b =>
+                    b.textContent.includes('Audio') &&
+                    (b.textContent.includes('Overview') || b.textContent.includes('Audio...'))
+                );
+                if (audioBtn) { audioBtn.click(); return 'audio-overview'; }
+
+                // Try "Notebook guide" as fallback
+                const guideBtn = allButtons.find(b => b.textContent.includes('Notebook guide'));
+                if (guideBtn) { guideBtn.click(); return 'notebook-guide'; }
+
+                return 'not-found';
+            }"""
         )
-        await generate_btn.click()
+        logger.info("Audio tab click result: %s", clicked)
+        await asyncio.sleep(3)
+
+        await page.screenshot(path="output/debug/after-audio-tab.png")
+
+        # Step 2: Click Generate button
+        gen_result = await page.evaluate(
+            """() => {
+                const buttons = [...document.querySelectorAll('button')];
+                // Prefer exact "Generate" button
+                let btn = buttons.find(b => b.textContent.trim() === 'Generate');
+                if (btn) { btn.click(); return 'generate'; }
+                // Try variations
+                btn = buttons.find(b => b.textContent.includes('Generate'));
+                if (btn) { btn.click(); return 'generate-partial'; }
+                btn = buttons.find(b => b.textContent.includes('Deep Dive'));
+                if (btn) { btn.click(); return 'deep-dive'; }
+                btn = buttons.find(b => b.textContent.trim() === 'Create');
+                if (btn) { btn.click(); return 'create'; }
+                return 'not-found';
+            }"""
+        )
+        logger.info("Generate button click result: %s", gen_result)
         await asyncio.sleep(2)
 
         logger.info("Audio generation triggered")
@@ -372,39 +420,49 @@ class NotebookLMAutomator:
         elapsed = 0
 
         while elapsed < AUDIO_GENERATION_TIMEOUT:
-            # Check for completion indicators
-            try:
-                # Look for play button or audio player (indicates completion)
-                play_btn = await page.wait_for_selector(
-                    "button[aria-label='Play'], "
-                    "button[aria-label='play_arrow'], "
-                    "audio, "
-                    "[aria-label='Play audio'], "
-                    ".audio-player button",
-                    timeout=AUDIO_POLL_INTERVAL * 1000,
-                )
-                if play_btn:
-                    logger.info("Audio generation complete (elapsed: %ds)", elapsed)
-                    return
-            except Exception:
-                pass
+            # Check for completion via JS — look for play button, but also ensure
+            # no active "Generating" indicator is present
+            status = await page.evaluate(
+                """() => {
+                    // First check if still generating
+                    const allText = document.body.innerText;
+                    const isGenerating = allText.includes('Generating Audio Overview');
+                    if (isGenerating) {
+                        return 'generating';
+                    }
 
-            # Check for error indicators
-            try:
-                error_el = await page.query_selector(
-                    ":text('error'), :text('failed'), :text('try again')"
-                )
-                if error_el:
-                    error_text = await error_el.inner_text()
-                    raise NotebookLMError(f"Audio generation failed: {error_text}")
-            except NotebookLMError:
-                raise
-            except Exception:
-                pass
+                    // Check for play button (multiple possible selectors)
+                    const playBtns = document.querySelectorAll(
+                        'button[aria-label="Play"], button[aria-label="play_arrow"], ' +
+                        '[aria-label="Play audio"], button[aria-label="Pause"]'
+                    );
+                    if (playBtns.length > 0) return 'ready:play-button';
+
+                    // Check for audio element
+                    if (document.querySelector('audio')) return 'ready:audio-element';
+
+                    // Check for error
+                    if (allText.includes('generation failed') || allText.includes('try again'))
+                        return 'error';
+
+                    return 'unknown';
+                }"""
+            )
+
+            if status.startswith("ready:"):
+                logger.info("Audio generation complete: %s (elapsed: %ds)", status, elapsed)
+                return
+
+            if status == "error":
+                raise NotebookLMError("Audio generation failed (error detected on page)")
 
             elapsed += AUDIO_POLL_INTERVAL
+
             if elapsed % 60 == 0:
-                logger.info("Still generating... (%ds elapsed)", elapsed)
+                logger.info("Still generating... (%ds elapsed, status: %s)", elapsed, status)
+                await page.screenshot(path=f"output/debug/audio-wait-{elapsed}s.png")
+
+            await asyncio.sleep(AUDIO_POLL_INTERVAL)
 
         raise AudioGenerationTimeoutError(
             f"Audio generation timed out after {AUDIO_GENERATION_TIMEOUT}s"
@@ -424,59 +482,84 @@ class NotebookLMAutomator:
         download_path.parent.mkdir(parents=True, exist_ok=True)
 
         logger.info("Downloading audio...")
+        await page.screenshot(path="output/debug/before-download.png")
 
-        # Try to find the more/download menu
+        # Find and click the three-dot menu (⋮) next to the audio entry
         try:
-            more_btn = await self._find_element(
-                page,
-                [
-                    "button[aria-label='More options']",
-                    "button[aria-label='more_vert']",
-                    ".audio-player button[aria-label='More']",
-                    "artifact-library button[aria-label='More options']",
-                ],
-                "more options button",
-                timeout=5000,
+            # Use force click on the three-dot menu button
+            # Try multiple selectors for the three-dot menu
+            three_dot_selectors = [
+                "button[aria-label='More actions']",
+                "button[aria-label='More options']",
+                "button[aria-label='more_vert']",
+                "mat-icon:has-text('more_vert')",
+            ]
+            clicked_menu = False
+            for selector in three_dot_selectors:
+                try:
+                    await page.locator(selector).last.click(force=True, timeout=3000)
+                    clicked_menu = True
+                    logger.info("Clicked three-dot menu via: %s", selector)
+                    break
+                except Exception:
+                    continue
+
+            if not clicked_menu:
+                # Fallback: find the three-dot button via JS
+                logger.info("Trying JS click for three-dot menu...")
+                await page.evaluate(
+                    """() => {
+                        // Look for three-dot menu buttons (usually the last button in an audio row)
+                        const btns = [...document.querySelectorAll('button')];
+                        const menuBtn = btns.find(b => {
+                            const icon = b.querySelector('mat-icon, .material-icons');
+                            return icon && icon.textContent.trim() === 'more_vert';
+                        });
+                        if (menuBtn) menuBtn.click();
+                    }"""
+                )
+
+            await asyncio.sleep(1)
+            await page.screenshot(path="output/debug/after-menu-click.png")
+
+            # Click download in the dropdown menu
+            async with page.expect_download(timeout=60000) as download_info:
+                download_clicked = await page.evaluate(
+                    """() => {
+                        const items = [...document.querySelectorAll(
+                            '[role="menuitem"], button, a'
+                        )];
+                        const dlItem = items.find(i => i.textContent.includes('Download'));
+                        if (dlItem) { dlItem.click(); return 'clicked'; }
+                        return 'not-found';
+                    }"""
+                )
+                logger.info("Download menu click result: %s", download_clicked)
+
+            download = await download_info.value
+            await download.save_as(str(download_path))
+
+        except Exception as e:
+            logger.info("Menu download failed (%s), checking for direct audio URL...", e)
+            await page.screenshot(path="output/debug/download-failed.png")
+
+            # Last resort: try to extract audio URL directly from the page
+            audio_url = await page.evaluate(
+                """() => {
+                    const audio = document.querySelector('audio');
+                    if (audio && audio.src) return audio.src;
+                    const sources = document.querySelectorAll('source');
+                    for (const s of sources) if (s.src) return s.src;
+                    return null;
+                }"""
             )
-            await more_btn.click()
-            await asyncio.sleep(0.5)
-
-            # Click download in menu
-            async with page.expect_download(timeout=60000) as download_info:
-                download_btn = await self._find_element(
-                    page,
-                    [
-                        "[role='menuitem']:has-text('Download')",
-                        "button:has-text('Download')",
-                        "[aria-label='Download']",
-                    ],
-                    "download menu item",
-                    timeout=5000,
-                )
-                await download_btn.click()
-
-            download = await download_info.value
-            await download.save_as(str(download_path))
-
-        except SelectorNotFoundError:
-            # Fallback: try direct download button
-            logger.info("Trying direct download button...")
-            async with page.expect_download(timeout=60000) as download_info:
-                download_btn = await self._find_element(
-                    page,
-                    [
-                        "button:has-text('Download')",
-                        "[aria-label='Download']",
-                        "a[download]",
-                        "button[aria-label='Download audio']",
-                    ],
-                    "download button",
-                    timeout=10000,
-                )
-                await download_btn.click()
-
-            download = await download_info.value
-            await download.save_as(str(download_path))
+            if audio_url:
+                logger.info("Found audio URL: %s", audio_url[:100])
+                response = await page.request.get(audio_url)
+                with open(str(download_path), "wb") as f:
+                    f.write(await response.body())
+            else:
+                raise SelectorNotFoundError(f"Could not download audio: {e}") from e
 
         file_size = download_path.stat().st_size
         logger.info("Audio downloaded: %s (%.1f MB)", download_path, file_size / (1024 * 1024))

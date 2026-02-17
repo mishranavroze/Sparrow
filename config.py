@@ -13,6 +13,7 @@ class Settings(BaseSettings):
 
     # Google account (for NotebookLM session — login is manual)
     google_account_email: str = ""
+    google_account_password: str = ""
 
     # Optional: Claude API for digest summarization
     anthropic_api_key: str = ""

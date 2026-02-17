@@ -45,8 +45,8 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
 
     fg.title(settings.podcast_title)
     fg.description(settings.podcast_description)
-    fg.link(href=settings.base_url, rel="alternate")
     fg.link(href=f"{settings.base_url}/feed.xml", rel="self")
+    fg.link(href=settings.base_url, rel="alternate")
     fg.language("en")
     fg.generator("Noctua Podcast Generator")
 
