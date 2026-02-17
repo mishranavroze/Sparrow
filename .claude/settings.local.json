@@ -23,7 +23,11 @@
       "Bash(python -m json.tool:*)",
       "Bash(fuser:*)",
       "Bash(ss -tlnp:*)",
-      "Bash(kill:*)"
+      "Bash(kill:*)",
+      "Bash(env:*)",
+      "Bash(test:*)",
+      "Bash(python generate.py:*)",
+      "Bash(python -m playwright:*)"
     ]
   }
 }
