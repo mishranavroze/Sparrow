@@ -24,6 +24,7 @@ class Article:
     title: str
     content: str
     estimated_words: int
+    topic: str = ""
 
 
 @dataclass
@@ -44,6 +45,7 @@ class CompiledDigest:
     total_words: int
     date: str  # YYYY-MM-DD
     topics_summary: str
+    segment_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass

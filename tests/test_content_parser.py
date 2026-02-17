@@ -148,3 +148,83 @@ def test_parse_emails_falls_back_to_text():
     digest = parse_emails(emails)
     assert len(digest.articles) == 1
     assert "plain text newsletter" in digest.articles[0].content.lower()
+
+
+# --- Transactional filtering ---
+
+
+def test_parse_emails_filters_transactional_sender():
+    body = (
+        "<html><body><p>Your Google storage is almost full. "
+        "Upgrade to Google One for more space and benefits.</p></body></html>"
+    )
+    emails = [
+        EmailMessage(
+            subject="Storage almost full",
+            sender='"Google" <no-reply@google.com>',
+            date=datetime.now(UTC),
+            body_html=body,
+            body_text="",
+        ),
+    ]
+    digest = parse_emails(emails)
+    assert len(digest.articles) == 0
+
+
+def test_parse_emails_filters_notebooklm():
+    body = (
+        "<html><body><p>Your notebook has been updated with new sources "
+        "and is ready for audio generation processing.</p></body></html>"
+    )
+    emails = [
+        EmailMessage(
+            subject="Notebook updated",
+            sender='"NotebookLM" <notebooklm@google.com>',
+            date=datetime.now(UTC),
+            body_html=body,
+            body_text="",
+        ),
+    ]
+    digest = parse_emails(emails)
+    assert len(digest.articles) == 0
+
+
+# --- Topic assignment ---
+
+
+def test_parse_emails_assigns_topic():
+    body = (
+        "<html><body><p>Congress passed a bipartisan bill in the Senate "
+        "today as Democrats and Republicans reached a deal on legislation.</p></body></html>"
+    )
+    emails = [
+        EmailMessage(
+            subject="Senate Passes Major Bill",
+            sender='"The New York Times" <nyt@nytimes.com>',
+            date=datetime.now(UTC),
+            body_html=body,
+            body_text="",
+        ),
+    ]
+    digest = parse_emails(emails)
+    assert len(digest.articles) == 1
+    assert digest.articles[0].topic != ""
+
+
+def test_parse_emails_assigns_topic_from_source():
+    body = (
+        "<html><body><p>This week in AI: new developments in machine learning "
+        "and the latest startup funding rounds in the tech industry.</p></body></html>"
+    )
+    emails = [
+        EmailMessage(
+            subject="AI Weekly",
+            sender='"The Neuron" <hello@theneuron.com>',
+            date=datetime.now(UTC),
+            body_html=body,
+            body_text="",
+        ),
+    ]
+    digest = parse_emails(emails)
+    assert len(digest.articles) == 1
+    assert digest.articles[0].topic == "Latest in Tech"

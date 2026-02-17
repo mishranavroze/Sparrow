@@ -43,7 +43,10 @@
       "Bash(replit deploy --help:*)",
       "Bash(deployctl --help:*)",
       "Bash(replit:*)",
-      "WebFetch(domain:6229f33b-21eb-4564-9877-7f8f012509a1-00-6rmk3izu0jsr.spock.replit.dev)"
+      "WebFetch(domain:6229f33b-21eb-4564-9877-7f8f012509a1-00-6rmk3izu0jsr.spock.replit.dev)",
+      "Bash(sqlite3:*)",
+      "Bash(python -m generate:*)",
+      "Bash(wc:*)"
     ]
   }
 }

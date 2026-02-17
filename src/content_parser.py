@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 
 from src.exceptions import ContentParseError
 from src.models import Article, DailyDigest, EmailMessage
+from src.topic_classifier import classify_article, _is_filtered_sender
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,12 @@ def parse_emails(emails: list[EmailMessage]) -> DailyDigest:
 
     for email in emails:
         try:
+            # Early filter: skip transactional senders before HTML parsing
+            source = _extract_sender_name(email.sender)
+            if _is_filtered_sender(source):
+                logger.info("Skipping transactional sender: '%s'", source)
+                continue
+
             content = ""
             if email.body_html:
                 content = _clean_html(email.body_html)
@@ -157,17 +164,23 @@ def parse_emails(emails: list[EmailMessage]) -> DailyDigest:
                 logger.warning("Skipping email '%s' — too little content", email.subject)
                 continue
 
-            source = _extract_sender_name(email.sender)
             word_count = len(content.split())
 
-            articles.append(
-                Article(
-                    source=source,
-                    title=email.subject,
-                    content=content,
-                    estimated_words=word_count,
-                )
+            article = Article(
+                source=source,
+                title=email.subject,
+                content=content,
+                estimated_words=word_count,
             )
+
+            # Classify article into a topic segment
+            topic = classify_article(article)
+            if topic is None:
+                logger.info("Filtered article by classification: '%s'", email.subject)
+                continue
+            article.topic = topic.value
+
+            articles.append(article)
 
         except Exception as e:
             logger.error("Failed to parse email '%s': %s", email.subject, e)

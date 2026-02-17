@@ -82,17 +82,19 @@ def _get_header(headers: list[dict], name: str) -> str:
     return ""
 
 
-def fetch_todays_emails() -> list[EmailMessage]:
-    """Fetch today's newsletter emails from Gmail.
+def fetch_yesterdays_emails() -> list[EmailMessage]:
+    """Fetch yesterday's newsletter emails from Gmail.
+
+    Fetches the previous day's emails so the full day is captured.
 
     Returns:
-        List of EmailMessage objects for today's newsletters.
+        List of EmailMessage objects for yesterday's newsletters.
     """
     service = _get_gmail_service()
 
     today = datetime.now(UTC).date()
-    tomorrow = today + timedelta(days=1)
-    query = f"after:{today.isoformat()} before:{tomorrow.isoformat()}"
+    yesterday = today - timedelta(days=1)
+    query = f"after:{yesterday.isoformat()} before:{today.isoformat()}"
     if settings.gmail_label:
         query = f"label:{settings.gmail_label} {query}"
 

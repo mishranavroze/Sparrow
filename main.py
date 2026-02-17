@@ -3,16 +3,17 @@
 import asyncio
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from config import settings
-from src import database
+from src import database, episode_manager, feed_builder
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -37,9 +38,9 @@ def _calc_next_run() -> datetime:
 
 
 async def _run_generation() -> None:
-    """Run the generation pipeline, guarded by a lock to prevent concurrent runs."""
+    """Run digest preparation (steps 1-3), guarded by a lock."""
     global _generation_running
-    from generate import generate_episode
+    from generate import generate_digest_only
 
     if _generation_lock.locked():
         logger.warning("Generation already in progress, skipping.")
@@ -48,9 +49,9 @@ async def _run_generation() -> None:
     async with _generation_lock:
         _generation_running = True
         try:
-            await generate_episode()
+            await generate_digest_only()
         except Exception as e:
-            logger.error("Generation pipeline failed: %s", e)
+            logger.error("Digest preparation failed: %s", e)
         finally:
             _generation_running = False
 
@@ -145,13 +146,39 @@ async def api_latest_episode():
     # Try to find matching digest
     digest = database.get_digest(date)
 
+    # Strip full markdown from the response — it's available as a download
+    digest_meta = None
+    if digest:
+        digest_meta = {
+            "date": digest["date"],
+            "article_count": digest["article_count"],
+            "total_words": digest["total_words"],
+            "topics_summary": digest["topics_summary"],
+            "download_url": f"/digests/{date}.md",
+        }
+
     return JSONResponse({
         "episode": {
             **latest,
             "audio_url": f"/episodes/noctua-{date}.mp3",
         },
-        "digest": digest,
+        "digest": digest_meta,
     })
+
+
+@app.get("/digests/{date}.md")
+async def digest_download(date: str) -> Response:
+    """Serve a digest as a downloadable .md file."""
+    if ".." in date or "/" in date:
+        return Response(content="Invalid date.", status_code=400)
+    digest = database.get_digest(date)
+    if not digest:
+        return Response(content="Digest not found.", status_code=404)
+    return Response(
+        content=digest["markdown_text"],
+        media_type="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="noctua-digest-{date}.md"'},
+    )
 
 
 # --- Feed & Episodes ---
@@ -218,14 +245,97 @@ async def episode(filename: str, request: Request) -> Response:
 
 @app.post("/api/generate")
 async def api_generate():
-    """Manually trigger episode generation."""
+    """Manually trigger digest preparation (steps 1-3)."""
     if _generation_lock.locked():
         return JSONResponse(
-            {"status": "already_running", "message": "Generation is already in progress."},
+            {"status": "already_running", "message": "Digest preparation is already in progress."},
             status_code=409,
         )
     asyncio.create_task(_run_generation())
-    return JSONResponse({"status": "started", "message": "Generation pipeline started."})
+    return JSONResponse({"status": "started", "message": "Digest preparation started."})
+
+
+@app.post("/api/upload-episode")
+async def api_upload_episode(file: UploadFile, date: str = ""):
+    """Upload an MP3 episode for a given digest date."""
+    # Validate date format
+    if not date or not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+        return JSONResponse(
+            {"error": "Invalid date format. Use YYYY-MM-DD."},
+            status_code=400,
+        )
+
+    # Validate the date is a real date
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        return JSONResponse(
+            {"error": "Invalid date."},
+            status_code=400,
+        )
+
+    # Check digest exists for that date
+    digest = database.get_digest(date)
+    if not digest:
+        return JSONResponse(
+            {"error": f"No digest found for {date}. Prepare a digest first."},
+            status_code=404,
+        )
+
+    # Validate file
+    if not file.filename or not file.filename.lower().endswith(".mp3"):
+        return JSONResponse(
+            {"error": "Only MP3 files are accepted."},
+            status_code=400,
+        )
+
+    # Save uploaded file
+    EPISODES_DIR.mkdir(parents=True, exist_ok=True)
+    mp3_path = EPISODES_DIR / f"noctua-{date}.mp3"
+    try:
+        contents = await file.read()
+        if len(contents) == 0:
+            return JSONResponse(
+                {"error": "Uploaded file is empty."},
+                status_code=400,
+            )
+        mp3_path.write_bytes(contents)
+    except Exception as e:
+        return JSONResponse(
+            {"error": f"Failed to save file: {e}"},
+            status_code=500,
+        )
+
+    # Process episode (validate MP3, extract metadata)
+    try:
+        topics_summary = digest.get("topics_summary", "")
+        metadata = episode_manager.process(mp3_path, topics_summary)
+    except Exception as e:
+        mp3_path.unlink(missing_ok=True)
+        return JSONResponse(
+            {"error": f"Episode processing failed: {e}"},
+            status_code=422,
+        )
+
+    # Publish to RSS feed
+    try:
+        feed_builder.add_episode(metadata)
+    except Exception as e:
+        return JSONResponse(
+            {"error": f"Feed update failed: {e}"},
+            status_code=500,
+        )
+
+    return JSONResponse({
+        "status": "ok",
+        "message": f"Episode for {date} published.",
+        "episode": {
+            "date": metadata.date,
+            "duration_formatted": metadata.duration_formatted,
+            "file_size_bytes": metadata.file_size_bytes,
+            "topics_summary": metadata.topics_summary,
+        },
+    })
 
 
 @app.get("/health")
@@ -373,58 +483,112 @@ DASHBOARD_HTML = """\
     outline: none;
   }
 
-  /* Digest section */
-  .digest-section {
-    margin-bottom: 32px;
+  /* Digest download card */
+  .digest-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
   }
 
-  .digest-section .section-title {
+  .digest-card .digest-info {
+    flex: 1;
+  }
+
+  .digest-card .digest-label {
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 1.5px;
     color: var(--accent);
-    margin-bottom: 16px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid var(--border);
-  }
-
-  /* Markdown */
-  .markdown h1 {
-    font-size: 18px;
-    color: var(--accent);
-    margin-bottom: 16px;
-    padding-bottom: 8px;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .markdown h2 {
-    font-size: 13px;
-    color: var(--blue);
-    margin-top: 28px;
-    margin-bottom: 4px;
-  }
-
-  .markdown h3 {
-    font-size: 14px;
-    color: var(--text);
     margin-bottom: 6px;
   }
 
-  .markdown p {
-    font-size: 13px;
-    line-height: 1.75;
-    color: var(--text);
+  .digest-card .digest-stats {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+  }
+
+  .digest-card .digest-topics {
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.5;
+  }
+
+  .digest-card .download-btn {
+    flex-shrink: 0;
+    font-size: 12px;
+    color: var(--bg);
+    background: var(--accent);
+    border: none;
+    padding: 8px 20px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: inherit;
+    font-weight: 500;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .digest-card .download-btn:hover { background: var(--accent-dim); }
+
+  /* Upload section */
+  .upload-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px 28px;
+    margin-top: 16px;
+  }
+
+  .upload-card .upload-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--accent);
     margin-bottom: 12px;
   }
 
-  .markdown hr {
-    border: none;
-    border-top: 1px solid var(--border);
-    margin: 24px 0;
+  .upload-card .upload-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
   }
 
-  .markdown a { color: var(--accent); text-decoration: none; }
-  .markdown a:hover { text-decoration: underline; }
+  .upload-card input[type="file"] {
+    font-family: inherit;
+    font-size: 12px;
+    color: var(--text-dim);
+    flex: 1;
+    min-width: 200px;
+  }
+
+  .upload-card .upload-btn {
+    font-size: 12px;
+    color: var(--bg);
+    background: var(--accent);
+    border: none;
+    padding: 8px 20px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: inherit;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .upload-card .upload-btn:hover { background: var(--accent-dim); }
+  .upload-card .upload-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .upload-card .upload-status {
+    font-size: 12px;
+    margin-top: 10px;
+    line-height: 1.5;
+  }
+  .upload-card .upload-status.error { color: var(--red); }
+  .upload-card .upload-status.success { color: var(--green); }
 
   /* Empty state */
   .empty-state {
@@ -462,7 +626,7 @@ DASHBOARD_HTML = """\
   </div>
   <div class="header-actions">
     <div class="scheduler-info" id="scheduler-info"></div>
-    <button class="btn" id="generate-btn" onclick="triggerGenerate()">Generate Now</button>
+    <button class="btn" id="generate-btn" onclick="triggerGenerate()">Prepare Digest</button>
     <a class="btn" href="/feed.xml">RSS Feed</a>
   </div>
 </header>
@@ -484,7 +648,7 @@ DASHBOARD_HTML = """\
       page.innerHTML = `
         <div class="empty-state">
           <div class="owl">&#x1F989;</div>
-          <p>No episodes yet.<br>Click <strong>Generate Now</strong> to create your first episode, or wait for the scheduled run.</p>
+          <p>No episodes yet.<br>Click <strong>Prepare Digest</strong> to fetch and compile today's newsletters, then upload the audio from NotebookLM.</p>
         </div>`;
       return;
     }
@@ -513,33 +677,32 @@ DASHBOARD_HTML = """\
         </div>`;
     }
 
-    // Digest content
-    if (data.digest && data.digest.markdown_text) {
+    // Digest download card
+    if (data.digest) {
       const d = data.digest;
       html += `
-        <div class="digest-section">
-          <div class="section-title">Today's Digest &mdash; ${d.article_count} articles, ${d.total_words.toLocaleString()} words</div>
-          <div class="markdown">${renderMarkdown(d.markdown_text)}</div>
+        <div class="digest-card">
+          <div class="digest-info">
+            <div class="digest-label">Today's Digest</div>
+            <div class="digest-stats">${d.article_count} articles &middot; ${d.total_words.toLocaleString()} words</div>
+            <div class="digest-topics">${escapeHtml(d.topics_summary || '')}</div>
+          </div>
+          <a class="download-btn" href="${d.download_url}" download>Download .md</a>
+        </div>`;
+
+      // Upload form — shown when a digest exists
+      html += `
+        <div class="upload-card">
+          <div class="upload-label">Upload Episode MP3</div>
+          <div class="upload-row">
+            <input type="file" id="mp3-file" accept=".mp3,audio/mpeg">
+            <button class="upload-btn" id="upload-btn" onclick="uploadEpisode('${escapeHtml(d.date)}')">Upload Episode</button>
+          </div>
+          <div class="upload-status" id="upload-status"></div>
         </div>`;
     }
 
     page.innerHTML = html;
-  }
-
-  function renderMarkdown(text) {
-    return text
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/^### (.+)$/gm, '<h3>$1</h3>')
-      .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-      .replace(/^# (.+)$/gm, '<h1>$1</h1>')
-      .replace(/^---$/gm, '<hr>')
-      .replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
-      .split('\\n\\n').map(block => {
-        block = block.trim();
-        if (!block) return '';
-        if (block.startsWith('<h') || block.startsWith('<hr')) return block;
-        return '<p>' + block.replace(/\\n/g, '<br>') + '</p>';
-      }).join('');
   }
 
   function escapeHtml(s) {
@@ -551,7 +714,7 @@ DASHBOARD_HTML = """\
   async function triggerGenerate() {
     const btn = document.getElementById('generate-btn');
     btn.disabled = true;
-    btn.textContent = 'Running...';
+    btn.textContent = 'Preparing...';
     try {
       await fetch('/api/generate', { method: 'POST' });
     } catch (e) {}
@@ -562,11 +725,51 @@ DASHBOARD_HTML = """\
         if (!h.generation_running) {
           clearInterval(poll);
           btn.disabled = false;
-          btn.textContent = 'Generate Now';
+          btn.textContent = 'Prepare Digest';
           load();
         }
       } catch (e) {}
     }, 5000);
+  }
+
+  async function uploadEpisode(date) {
+    const fileInput = document.getElementById('mp3-file');
+    const btn = document.getElementById('upload-btn');
+    const status = document.getElementById('upload-status');
+
+    if (!fileInput.files.length) {
+      status.className = 'upload-status error';
+      status.textContent = 'Please select an MP3 file first.';
+      return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = 'Uploading...';
+    status.className = 'upload-status';
+    status.textContent = 'Uploading and processing...';
+
+    const form = new FormData();
+    form.append('file', fileInput.files[0]);
+    form.append('date', date);
+
+    try {
+      const res = await fetch('/api/upload-episode', { method: 'POST', body: form });
+      const data = await res.json();
+      if (res.ok) {
+        status.className = 'upload-status success';
+        status.textContent = data.message;
+        setTimeout(() => load(), 1500);
+      } else {
+        status.className = 'upload-status error';
+        status.textContent = data.error || 'Upload failed.';
+      }
+    } catch (e) {
+      status.className = 'upload-status error';
+      status.textContent = 'Network error. Please try again.';
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'Upload Episode';
   }
 
   async function updateHealth() {
@@ -576,10 +779,10 @@ DASHBOARD_HTML = """\
       const info = document.getElementById('scheduler-info');
       if (h.generation_running) {
         btn.disabled = true;
-        btn.textContent = 'Running...';
+        btn.textContent = 'Preparing...';
       } else {
         btn.disabled = false;
-        btn.textContent = 'Generate Now';
+        btn.textContent = 'Prepare Digest';
       }
       if (h.next_scheduled_run) {
         const next = new Date(h.next_scheduled_run);
