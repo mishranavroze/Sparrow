@@ -1,6 +1,7 @@
 """FastAPI app — serves RSS feed, audio files, and dashboard."""
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -17,6 +18,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 logger = logging.getLogger(__name__)
 
 EPISODES_DIR = Path("output/episodes")
+EPISODES_JSON = Path("output/episodes.json")
 FEED_PATH = Path("output/feed.xml")
 
 # --- Generation state ---
@@ -92,7 +94,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard() -> str:
-    """Main dashboard with digest viewer, pipeline status, and logs."""
+    """Main dashboard showing latest episode with audio player and digest."""
     return DASHBOARD_HTML
 
 
@@ -124,6 +126,32 @@ async def api_run(run_id: str):
     if not run:
         return JSONResponse({"error": "Run not found"}, status_code=404)
     return JSONResponse(run)
+
+
+@app.get("/api/latest-episode")
+async def api_latest_episode():
+    """Get the latest episode with its digest."""
+    # Load episodes catalog
+    if not EPISODES_JSON.exists():
+        return JSONResponse({"episode": None, "digest": None})
+    episodes = json.loads(EPISODES_JSON.read_text())
+    if not episodes:
+        return JSONResponse({"episode": None, "digest": None})
+
+    # Most recent episode
+    latest = sorted(episodes, key=lambda e: e["date"], reverse=True)[0]
+    date = latest["date"]
+
+    # Try to find matching digest
+    digest = database.get_digest(date)
+
+    return JSONResponse({
+        "episode": {
+            **latest,
+            "audio_url": f"/episodes/noctua-{date}.mp3",
+        },
+        "digest": digest,
+    })
 
 
 # --- Feed & Episodes ---
@@ -225,7 +253,7 @@ DASHBOARD_HTML = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Noctua Dashboard</title>
+<title>Noctua</title>
 <style>
   :root {
     --bg: #0f1117;
@@ -278,7 +306,7 @@ DASHBOARD_HTML = """\
     gap: 10px;
   }
 
-  header .feed-link, header .generate-btn {
+  .btn {
     font-size: 12px;
     color: var(--accent);
     text-decoration: none;
@@ -289,9 +317,9 @@ DASHBOARD_HTML = """\
     background: transparent;
     font-family: inherit;
   }
-  header .feed-link:hover, header .generate-btn:hover { background: var(--accent-dim); color: var(--bg); }
-  header .generate-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  header .generate-btn:disabled:hover { background: transparent; color: var(--accent); }
+  .btn:hover { background: var(--accent-dim); color: var(--bg); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn:disabled:hover { background: transparent; color: var(--accent); }
 
   .scheduler-info {
     font-size: 10px;
@@ -299,267 +327,129 @@ DASHBOARD_HTML = """\
     text-align: right;
   }
 
-  .container {
-    display: grid;
-    grid-template-columns: 300px 1fr;
-    height: calc(100vh - 57px);
+  /* Main layout */
+  .page {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 32px 24px;
   }
 
-  /* Sidebar */
-  .sidebar {
-    border-right: 1px solid var(--border);
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
+  /* Episode player card */
+  .episode-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 28px;
+    margin-bottom: 32px;
   }
 
-  .tab-bar {
-    display: flex;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .tab {
-    flex: 1;
-    padding: 10px;
-    text-align: center;
+  .episode-card .episode-date {
     font-size: 11px;
     text-transform: uppercase;
-    letter-spacing: 1px;
-    cursor: pointer;
-    color: var(--text-dim);
-    background: transparent;
-    border: none;
-    border-bottom: 2px solid transparent;
-    font-family: inherit;
-  }
-
-  .tab.active {
+    letter-spacing: 1.5px;
     color: var(--accent);
-    border-bottom-color: var(--accent);
-  }
-
-  .tab:hover { color: var(--text); }
-
-  .sidebar-content {
-    flex: 1;
-    overflow-y: auto;
-    padding: 8px;
-  }
-
-  .digest-item, .run-item {
-    padding: 10px 12px;
-    border-radius: 6px;
-    cursor: pointer;
-    margin-bottom: 4px;
-    border: 1px solid transparent;
-  }
-
-  .digest-item:hover, .run-item:hover {
-    background: var(--surface2);
-    border-color: var(--border);
-  }
-
-  .digest-item.active, .run-item.active {
-    background: var(--surface2);
-    border-color: var(--accent-dim);
-  }
-
-  .digest-date {
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--text);
-  }
-
-  .digest-meta {
-    font-size: 11px;
-    color: var(--text-dim);
-    margin-top: 3px;
-  }
-
-  .run-time {
-    font-size: 12px;
-    color: var(--text);
-  }
-
-  .run-status {
-    font-size: 11px;
-    margin-top: 3px;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .status-dot {
-    width: 7px; height: 7px;
-    border-radius: 50%;
-    display: inline-block;
-  }
-
-  .status-dot.success { background: var(--green); }
-  .status-dot.failed { background: var(--red); }
-  .status-dot.running { background: var(--yellow); animation: pulse 1.5s infinite; }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
-  }
-
-  /* Main content area */
-  .main {
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-
-  .content-header {
-    padding: 16px 24px;
-    border-bottom: 1px solid var(--border);
-    background: var(--surface);
-  }
-
-  .content-header h2 {
-    font-size: 15px;
-    font-weight: 500;
-    color: var(--text);
-  }
-
-  .content-header .meta {
-    font-size: 11px;
-    color: var(--text-dim);
-    margin-top: 4px;
-  }
-
-  .content-body {
-    flex: 1;
-    overflow-y: auto;
-    padding: 24px;
-  }
-
-  /* Markdown rendering */
-  .markdown-content h1 {
-    font-size: 20px;
-    color: var(--accent);
-    margin-bottom: 16px;
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 8px;
-  }
-
-  .markdown-content h2 {
-    font-size: 14px;
-    color: var(--blue);
-    margin-top: 24px;
-    margin-bottom: 4px;
-  }
-
-  .markdown-content h3 {
-    font-size: 15px;
-    color: var(--text);
     margin-bottom: 8px;
   }
 
-  .markdown-content p {
+  .episode-card .episode-title {
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 6px;
+  }
+
+  .episode-card .episode-meta {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 20px;
+    display: flex;
+    gap: 16px;
+  }
+
+  .episode-card audio {
+    width: 100%;
+    height: 48px;
+    border-radius: 8px;
+    outline: none;
+  }
+
+  /* Digest section */
+  .digest-section {
+    margin-bottom: 32px;
+  }
+
+  .digest-section .section-title {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--accent);
+    margin-bottom: 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* Markdown */
+  .markdown h1 {
+    font-size: 18px;
+    color: var(--accent);
+    margin-bottom: 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .markdown h2 {
     font-size: 13px;
-    line-height: 1.7;
+    color: var(--blue);
+    margin-top: 28px;
+    margin-bottom: 4px;
+  }
+
+  .markdown h3 {
+    font-size: 14px;
+    color: var(--text);
+    margin-bottom: 6px;
+  }
+
+  .markdown p {
+    font-size: 13px;
+    line-height: 1.75;
     color: var(--text);
     margin-bottom: 12px;
   }
 
-  .markdown-content hr {
+  .markdown hr {
     border: none;
     border-top: 1px solid var(--border);
-    margin: 20px 0;
+    margin: 24px 0;
   }
 
-  .markdown-content a {
-    color: var(--accent);
-    text-decoration: none;
-  }
+  .markdown a { color: var(--accent); text-decoration: none; }
+  .markdown a:hover { text-decoration: underline; }
 
-  .markdown-content a:hover { text-decoration: underline; }
-
-  /* Pipeline log view */
-  .pipeline-steps {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-
-  .step-item {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-    padding: 12px;
-    background: var(--surface);
-    border-radius: 6px;
-    border-left: 3px solid var(--border);
-  }
-
-  .step-item.success { border-left-color: var(--green); }
-  .step-item.failed { border-left-color: var(--red); }
-  .step-item.running { border-left-color: var(--yellow); }
-
-  .step-icon { font-size: 16px; width: 20px; text-align: center; }
-
-  .step-details { flex: 1; }
-
-  .step-name {
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--text);
-  }
-
-  .step-message {
-    font-size: 11px;
-    color: var(--text-dim);
-    margin-top: 3px;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-
-  .step-time {
-    font-size: 10px;
-    color: var(--text-dim);
-  }
-
-  .error-box {
-    margin-top: 16px;
-    padding: 12px;
-    background: rgba(248, 113, 113, 0.1);
-    border: 1px solid rgba(248, 113, 113, 0.3);
-    border-radius: 6px;
-    font-size: 12px;
-    color: var(--red);
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-
+  /* Empty state */
   .empty-state {
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    height: 100%;
+    min-height: 60vh;
     color: var(--text-dim);
     text-align: center;
     padding: 40px;
   }
 
-  .empty-state .owl { font-size: 48px; margin-bottom: 16px; opacity: 0.5; }
-  .empty-state p { font-size: 13px; line-height: 1.6; }
+  .empty-state .owl { font-size: 56px; margin-bottom: 20px; opacity: 0.4; }
+  .empty-state p { font-size: 13px; line-height: 1.7; max-width: 400px; }
 
-  .sidebar-content::-webkit-scrollbar,
-  .content-body::-webkit-scrollbar {
-    width: 6px;
-  }
-  .sidebar-content::-webkit-scrollbar-thumb,
-  .content-body::-webkit-scrollbar-thumb {
-    background: var(--border);
-    border-radius: 3px;
-  }
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
-  @media (max-width: 768px) {
-    .container { grid-template-columns: 1fr; }
-    .sidebar { max-height: 40vh; }
+  @media (max-width: 640px) {
+    .page { padding: 20px 16px; }
+    .episode-card { padding: 20px; }
+    .episode-card .episode-title { font-size: 18px; }
+    .episode-card .episode-meta { flex-direction: column; gap: 4px; }
   }
 </style>
 </head>
@@ -572,145 +462,70 @@ DASHBOARD_HTML = """\
   </div>
   <div class="header-actions">
     <div class="scheduler-info" id="scheduler-info"></div>
-    <button class="generate-btn" id="generate-btn" onclick="triggerGenerate()">Generate Now</button>
-    <a class="feed-link" href="/feed.xml">RSS Feed</a>
+    <button class="btn" id="generate-btn" onclick="triggerGenerate()">Generate Now</button>
+    <a class="btn" href="/feed.xml">RSS Feed</a>
   </div>
 </header>
 
-<div class="container">
-  <div class="sidebar">
-    <div class="tab-bar">
-      <button class="tab active" data-tab="digests" onclick="switchTab('digests')">Digests</button>
-      <button class="tab" data-tab="runs" onclick="switchTab('runs')">Pipeline Runs</button>
-    </div>
-    <div class="sidebar-content" id="sidebar-content"></div>
-  </div>
-
-  <div class="main">
-    <div class="content-header" id="content-header" style="display:none">
-      <h2 id="content-title"></h2>
-      <div class="meta" id="content-meta"></div>
-    </div>
-    <div class="content-body" id="content-body">
-      <div class="empty-state">
-        <div class="owl">&#x1F989;</div>
-        <p>Select a digest or pipeline run from the sidebar to view details.</p>
-      </div>
-    </div>
+<div class="page" id="page">
+  <div class="empty-state" id="loading">
+    <div class="owl">&#x1F989;</div>
+    <p>Loading...</p>
   </div>
 </div>
 
 <script>
-  let currentTab = 'digests';
-  let digestsCache = [];
-  let runsCache = [];
-
   async function load() {
-    const [dRes, rRes] = await Promise.all([
-      fetch('/api/digests'),
-      fetch('/api/runs')
-    ]);
-    digestsCache = await dRes.json();
-    runsCache = await rRes.json();
-    renderSidebar();
-  }
+    const res = await fetch('/api/latest-episode');
+    const data = await res.json();
+    const page = document.getElementById('page');
 
-  function switchTab(tab) {
-    currentTab = tab;
-    document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
-    renderSidebar();
-  }
-
-  function renderSidebar() {
-    const el = document.getElementById('sidebar-content');
-    if (currentTab === 'digests') {
-      if (digestsCache.length === 0) {
-        el.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-dim);font-size:12px;">No digests yet. Run the pipeline to generate your first digest.</div>';
-        return;
-      }
-      el.innerHTML = digestsCache.map(d => `
-        <div class="digest-item" onclick="showDigest('${d.date}')">
-          <div class="digest-date">${formatDate(d.date)}</div>
-          <div class="digest-meta">${d.article_count} articles &middot; ${d.total_words.toLocaleString()} words</div>
-        </div>
-      `).join('');
-    } else {
-      if (runsCache.length === 0) {
-        el.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-dim);font-size:12px;">No pipeline runs yet.</div>';
-        return;
-      }
-      el.innerHTML = runsCache.map(r => `
-        <div class="run-item" onclick="showRun('${r.run_id}')">
-          <div class="run-time">${formatTimestamp(r.started_at)}</div>
-          <div class="run-status">
-            <span class="status-dot ${r.status}"></span>
-            <span style="color:${statusColor(r.status)}">${r.status}</span>
-            ${r.current_step ? ' &middot; ' + r.current_step : ''}
-          </div>
-        </div>
-      `).join('');
+    if (!data.episode && !data.digest) {
+      page.innerHTML = `
+        <div class="empty-state">
+          <div class="owl">&#x1F989;</div>
+          <p>No episodes yet.<br>Click <strong>Generate Now</strong> to create your first episode, or wait for the scheduled run.</p>
+        </div>`;
+      return;
     }
-  }
 
-  async function showDigest(date) {
-    document.querySelectorAll('.digest-item').forEach(el => el.classList.remove('active'));
-    event.currentTarget.classList.add('active');
+    let html = '';
 
-    const res = await fetch(`/api/digests/${date}`);
-    const d = await res.json();
+    // Episode player card
+    if (data.episode) {
+      const ep = data.episode;
+      const dt = new Date(ep.date + 'T00:00:00');
+      const displayDate = dt.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+      const sizeMB = (ep.file_size_bytes / (1024 * 1024)).toFixed(1);
 
-    document.getElementById('content-header').style.display = 'block';
-    document.getElementById('content-title').textContent = `Daily Digest — ${formatDate(date)}`;
-    document.getElementById('content-meta').textContent =
-      `${d.article_count} articles | ${d.total_words.toLocaleString()} words | ${d.topics_summary}`;
-
-    document.getElementById('content-body').innerHTML =
-      '<div class="markdown-content">' + renderMarkdown(d.markdown_text) + '</div>';
-  }
-
-  async function showRun(runId) {
-    document.querySelectorAll('.run-item').forEach(el => el.classList.remove('active'));
-    event.currentTarget.classList.add('active');
-
-    const res = await fetch(`/api/runs/${runId}`);
-    const r = await res.json();
-
-    document.getElementById('content-header').style.display = 'block';
-    document.getElementById('content-title').textContent = `Pipeline Run — ${formatTimestamp(r.started_at)}`;
-
-    const duration = r.finished_at
-      ? formatDuration(new Date(r.finished_at) - new Date(r.started_at))
-      : 'running...';
-    document.getElementById('content-meta').innerHTML =
-      `Status: <span style="color:${statusColor(r.status)}">${r.status}</span> | Duration: ${duration}`;
-
-    let html = '<div class="pipeline-steps">';
-    for (const step of r.steps_log) {
-      const icon = step.status === 'success' ? '&#10003;'
-        : step.status === 'failed' ? '&#10007;'
-        : step.status === 'skipped' ? '&#8212;'
-        : '&#9679;';
       html += `
-        <div class="step-item ${step.status}">
-          <div class="step-icon">${icon}</div>
-          <div class="step-details">
-            <div class="step-name">${escapeHtml(step.step)}</div>
-            ${step.message ? `<div class="step-message">${escapeHtml(step.message)}</div>` : ''}
+        <div class="episode-card">
+          <div class="episode-date">Latest Episode</div>
+          <div class="episode-title">Noctua &mdash; ${escapeHtml(displayDate)}</div>
+          <div class="episode-meta">
+            <span>${ep.duration_formatted || ''}</span>
+            <span>${sizeMB} MB</span>
+            <span>${escapeHtml(ep.topics_summary || '')}</span>
           </div>
-          <div class="step-time">${formatTimestamp(step.timestamp)}</div>
-        </div>
-      `;
-    }
-    html += '</div>';
-
-    if (r.error_message) {
-      html += `<div class="error-box"><strong>Error:</strong>\\n${escapeHtml(r.error_message)}</div>`;
+          <audio controls preload="metadata" src="${ep.audio_url}">
+            Your browser does not support the audio element.
+          </audio>
+        </div>`;
     }
 
-    document.getElementById('content-body').innerHTML = html;
+    // Digest content
+    if (data.digest && data.digest.markdown_text) {
+      const d = data.digest;
+      html += `
+        <div class="digest-section">
+          <div class="section-title">Today's Digest &mdash; ${d.article_count} articles, ${d.total_words.toLocaleString()} words</div>
+          <div class="markdown">${renderMarkdown(d.markdown_text)}</div>
+        </div>`;
+    }
+
+    page.innerHTML = html;
   }
 
-  // Simple markdown-to-HTML (handles headings, hrs, links, paragraphs)
   function renderMarkdown(text) {
     return text
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -718,17 +533,13 @@ DASHBOARD_HTML = """\
       .replace(/^## (.+)$/gm, '<h2>$1</h2>')
       .replace(/^# (.+)$/gm, '<h1>$1</h1>')
       .replace(/^---$/gm, '<hr>')
-      .replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2" target="_blank">$1</a>')
-      .replace(/\\n\\n/g, '</p><p>')
-      .replace(/^(?!<[h1-6hr])/gm, function(m, offset, str) {
-        return '';
-      })
+      .replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
       .split('\\n\\n').map(block => {
         block = block.trim();
         if (!block) return '';
         if (block.startsWith('<h') || block.startsWith('<hr')) return block;
-        return '<p>' + block + '</p>';
-      }).join('\\n');
+        return '<p>' + block.replace(/\\n/g, '<br>') + '</p>';
+      }).join('');
   }
 
   function escapeHtml(s) {
@@ -737,55 +548,30 @@ DASHBOARD_HTML = """\
     return d.innerHTML;
   }
 
-  function formatDate(dateStr) {
-    const [y, m, d] = dateStr.split('-');
-    const dt = new Date(y, m - 1, d);
-    return dt.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
-  }
-
-  function formatTimestamp(iso) {
-    if (!iso) return '';
-    const dt = new Date(iso);
-    return dt.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-  }
-
-  function formatDuration(ms) {
-    const s = Math.floor(ms / 1000);
-    if (s < 60) return s + 's';
-    if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
-    return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
-  }
-
-  function statusColor(status) {
-    return status === 'success' ? 'var(--green)'
-      : status === 'failed' ? 'var(--red)'
-      : 'var(--yellow)';
-  }
-
   async function triggerGenerate() {
     const btn = document.getElementById('generate-btn');
     btn.disabled = true;
-    btn.textContent = 'Starting...';
+    btn.textContent = 'Running...';
     try {
-      const res = await fetch('/api/generate', { method: 'POST' });
-      const data = await res.json();
-      if (res.status === 409) {
-        btn.textContent = 'Running...';
-      } else {
-        btn.textContent = 'Running...';
-        switchTab('runs');
-      }
-    } catch (e) {
-      btn.textContent = 'Generate Now';
-      btn.disabled = false;
-    }
-    setTimeout(load, 2000);
+      await fetch('/api/generate', { method: 'POST' });
+    } catch (e) {}
+    // Poll for completion
+    const poll = setInterval(async () => {
+      try {
+        const h = await (await fetch('/health')).json();
+        if (!h.generation_running) {
+          clearInterval(poll);
+          btn.disabled = false;
+          btn.textContent = 'Generate Now';
+          load();
+        }
+      } catch (e) {}
+    }, 5000);
   }
 
   async function updateHealth() {
     try {
-      const res = await fetch('/health');
-      const h = await res.json();
+      const h = await (await fetch('/health')).json();
       const btn = document.getElementById('generate-btn');
       const info = document.getElementById('scheduler-info');
       if (h.generation_running) {
@@ -804,7 +590,6 @@ DASHBOARD_HTML = """\
 
   load();
   updateHealth();
-  setInterval(load, 15000);
   setInterval(updateHealth, 10000);
 </script>
 

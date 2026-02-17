@@ -55,7 +55,7 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
     fg.podcast.itunes_author(settings.podcast_title)
     fg.podcast.itunes_explicit("no")
     fg.podcast.itunes_summary(settings.podcast_description)
-    fg.podcast.itunes_owner(name=settings.podcast_title, email="noctua@example.com")
+    fg.podcast.itunes_owner(name=settings.podcast_title, email="aannesha.satpati@gmail.com")
     # Placeholder image — replace with real artwork later
     fg.podcast.itunes_image(f"{settings.base_url}/static/cover.jpg")
 
