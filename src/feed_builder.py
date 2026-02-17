@@ -48,7 +48,7 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
     fg.link(href=f"{settings.base_url}/feed.xml", rel="self")
     fg.link(href=settings.base_url, rel="alternate")
     fg.language("en")
-    fg.generator("Noctua Podcast Generator")
+    fg.generator("The Hootline Podcast Generator")
 
     # Podcast-specific metadata
     fg.podcast.itunes_category("News", "Daily News")
@@ -64,7 +64,7 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
         fe = fg.add_entry()
         fe.id(f"{settings.base_url}/episodes/noctua-{ep['date']}.mp3")
 
-        # Format title as "Noctua — February 16, 2026"
+        # Format title as "The Hootline — February 16, 2026"
         try:
             dt = datetime.strptime(ep["date"], "%Y-%m-%d")
             display_date = dt.strftime("%B %d, %Y")

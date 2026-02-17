@@ -4,16 +4,19 @@ import asyncio
 import json
 import logging
 import re
+import subprocess
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, Request, Response, UploadFile
+from fastapi import FastAPI, Form, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from config import settings
 from src import database, episode_manager, feed_builder
+
+ACCEPTED_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".webm"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -85,7 +88,7 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="Noctua", description="Daily podcast generator", lifespan=lifespan)
+app = FastAPI(title="The Hootline", description="Daily podcast generator", lifespan=lifespan)
 
 # Serve static assets (cover image, etc.)
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -131,38 +134,35 @@ async def api_run(run_id: str):
 
 @app.get("/api/latest-episode")
 async def api_latest_episode():
-    """Get the latest episode with its digest."""
+    """Get the latest episode and the latest digest."""
     # Load episodes catalog
-    if not EPISODES_JSON.exists():
-        return JSONResponse({"episode": None, "digest": None})
-    episodes = json.loads(EPISODES_JSON.read_text())
-    if not episodes:
-        return JSONResponse({"episode": None, "digest": None})
+    episode_data = None
+    if EPISODES_JSON.exists():
+        episodes = json.loads(EPISODES_JSON.read_text())
+        if episodes:
+            latest = sorted(episodes, key=lambda e: e["date"], reverse=True)[0]
+            episode_data = {
+                **latest,
+                "audio_url": f"/episodes/noctua-{latest['date']}.mp3",
+            }
 
-    # Most recent episode
-    latest = sorted(episodes, key=lambda e: e["date"], reverse=True)[0]
-    date = latest["date"]
-
-    # Try to find matching digest
-    digest = database.get_digest(date)
-
-    # Strip full markdown from the response — it's available as a download
+    # Get the most recent digest (independent of episode date)
     digest_meta = None
-    if digest:
-        digest_meta = {
-            "date": digest["date"],
-            "article_count": digest["article_count"],
-            "total_words": digest["total_words"],
-            "total_chars": len(digest["markdown_text"]),
-            "topics_summary": digest["topics_summary"],
-            "download_url": f"/digests/{date}.md",
-        }
+    all_digests = database.list_digests(limit=1)
+    if all_digests:
+        latest_digest = database.get_digest(all_digests[0]["date"])
+        if latest_digest:
+            digest_meta = {
+                "date": latest_digest["date"],
+                "article_count": latest_digest["article_count"],
+                "total_words": latest_digest["total_words"],
+                "total_chars": len(latest_digest["markdown_text"]),
+                "topics_summary": latest_digest["topics_summary"],
+                "download_url": f"/digests/{latest_digest['date']}.md",
+            }
 
     return JSONResponse({
-        "episode": {
-            **latest,
-            "audio_url": f"/episodes/noctua-{date}.mp3",
-        },
+        "episode": episode_data,
         "digest": digest_meta,
     })
 
@@ -257,7 +257,7 @@ async def api_generate():
 
 
 @app.post("/api/upload-episode")
-async def api_upload_episode(file: UploadFile, date: str = ""):
+async def api_upload_episode(file: UploadFile, date: str = Form("")):
     """Upload an MP3 episode for a given digest date."""
     # Validate date format
     if not date or not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
@@ -283,16 +283,20 @@ async def api_upload_episode(file: UploadFile, date: str = ""):
             status_code=404,
         )
 
-    # Validate file
-    if not file.filename or not file.filename.lower().endswith(".mp3"):
+    # Validate file extension
+    if not file.filename:
+        return JSONResponse({"error": "No file provided."}, status_code=400)
+    ext = Path(file.filename).suffix.lower()
+    if ext not in ACCEPTED_AUDIO_EXTENSIONS:
         return JSONResponse(
-            {"error": "Only MP3 files are accepted."},
+            {"error": f"Unsupported format '{ext}'. Accepted: {', '.join(sorted(ACCEPTED_AUDIO_EXTENSIONS))}"},
             status_code=400,
         )
 
     # Save uploaded file
     EPISODES_DIR.mkdir(parents=True, exist_ok=True)
     mp3_path = EPISODES_DIR / f"noctua-{date}.mp3"
+    upload_path = EPISODES_DIR / f"noctua-{date}{ext}"
     try:
         contents = await file.read()
         if len(contents) == 0:
@@ -300,12 +304,34 @@ async def api_upload_episode(file: UploadFile, date: str = ""):
                 {"error": "Uploaded file is empty."},
                 status_code=400,
             )
-        mp3_path.write_bytes(contents)
+        upload_path.write_bytes(contents)
     except Exception as e:
         return JSONResponse(
             {"error": f"Failed to save file: {e}"},
             status_code=500,
         )
+
+    # Convert to MP3 if needed
+    if ext != ".mp3":
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-i", str(upload_path), "-codec:a", "libmp3lame", "-qscale:a", "2", "-y", str(mp3_path)],
+                capture_output=True, text=True,
+            )
+            upload_path.unlink(missing_ok=True)
+            if result.returncode != 0:
+                mp3_path.unlink(missing_ok=True)
+                return JSONResponse(
+                    {"error": f"Audio conversion failed: {result.stderr[:300]}"},
+                    status_code=422,
+                )
+            logger.info("Converted %s to MP3", ext)
+        except FileNotFoundError:
+            upload_path.unlink(missing_ok=True)
+            return JSONResponse(
+                {"error": "ffmpeg not found. Cannot convert audio."},
+                status_code=500,
+            )
 
     # Process episode (validate MP3, extract metadata)
     try:
@@ -364,7 +390,7 @@ DASHBOARD_HTML = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Noctua</title>
+<title>The Hootline</title>
 <style>
   :root {
     --bg: #0f1117;
@@ -622,7 +648,7 @@ DASHBOARD_HTML = """\
 
 <header>
   <div>
-    <h1>NOCTUA</h1>
+    <h1>THE HOOTLINE</h1>
     <div class="tagline">The owl of Minerva spreads its wings only with the falling of dusk.</div>
   </div>
   <div class="header-actions">
@@ -666,7 +692,7 @@ DASHBOARD_HTML = """\
       html += `
         <div class="episode-card">
           <div class="episode-date">Latest Episode</div>
-          <div class="episode-title">Noctua &mdash; ${escapeHtml(displayDate)}</div>
+          <div class="episode-title">The Hootline &mdash; ${escapeHtml(displayDate)}</div>
           <div class="episode-meta">
             <span>${ep.duration_formatted || ''}</span>
             <span>${sizeMB} MB</span>
@@ -696,7 +722,7 @@ DASHBOARD_HTML = """\
         <div class="upload-card">
           <div class="upload-label">Upload Episode MP3</div>
           <div class="upload-row">
-            <input type="file" id="mp3-file" accept=".mp3,audio/mpeg">
+            <input type="file" id="mp3-file" accept=".mp3,.m4a,.wav,.ogg,.webm,audio/*">
             <button class="upload-btn" id="upload-btn" onclick="uploadEpisode('${escapeHtml(d.date)}')">Upload Episode</button>
           </div>
           <div class="upload-status" id="upload-status"></div>

@@ -73,7 +73,7 @@ def test_compile_empty_raises():
 def test_compile_text_includes_segment_structure():
     digest = _make_digest()
     text, segment_counts = _compile_text(digest, "February 17, 2026")
-    assert "# Noctua Daily Briefing" in text
+    assert "# The Hootline" in text
     assert "SEGMENT" in text
     assert "---" in text
 
@@ -85,7 +85,7 @@ def test_compile_text_includes_preamble():
 
 
 def test_compile_text_segments_in_order():
-    """Segments should appear in the defined order: World Politics before US Politics before Tech."""
+    """Segments should appear in priority order: Tech before World Politics before US Politics."""
     articles = [
         _make_article(source="Neuron", title="Tech Article", topic=Topic.TECH_AI.value),
         _make_article(source="NYT", title="US Politics Article", topic=Topic.US_POLITICS.value),
@@ -94,11 +94,11 @@ def test_compile_text_segments_in_order():
     digest = _make_digest(articles)
     text, _ = _compile_text(digest, "February 17, 2026")
 
+    tech_pos = text.index("Tech Article")
     world_pos = text.index("World Politics Article")
     us_pos = text.index("US Politics Article")
-    tech_pos = text.index("Tech Article")
 
-    assert world_pos < us_pos < tech_pos
+    assert tech_pos < world_pos < us_pos
 
 
 def test_compile_text_skips_empty_segments():
@@ -192,12 +192,13 @@ def test_compile_returns_segment_counts():
 
 
 def test_compile_text_duration_labels():
-    """World Politics and US Politics should have ~5 minutes labels."""
+    """All segments should have duration labels."""
     articles = [
         _make_article(source="NYT", title="World News", topic=Topic.WORLD_POLITICS.value),
-        _make_article(source="NYT", title="US News", topic=Topic.US_POLITICS.value),
+        _make_article(source="Neuron", title="Tech News", topic=Topic.TECH_AI.value),
     ]
     digest = _make_digest(articles)
     text, _ = _compile_text(digest, "February 17, 2026")
 
-    assert "~5 minutes" in text
+    assert "~5 minutes" in text  # Tech
+    assert "~4 minutes" in text  # World Politics

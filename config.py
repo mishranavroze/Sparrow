@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     # Serving
     base_url: str = "http://localhost:8000"
-    podcast_title: str = "Noctua"
+    podcast_title: str = "The Hootline"
     podcast_description: str = (
         "Your nightly knowledge briefing. "
         "The owl of Minerva spreads its wings only with the falling of dusk."

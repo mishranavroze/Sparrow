@@ -52,7 +52,7 @@ def test_build_feed_generator():
     ]
     fg = _build_feed_generator(episodes)
     rss = fg.rss_str(pretty=True).decode()
-    assert "Noctua" in rss
+    assert "The Hootline" in rss
     assert "audio/mpeg" in rss
     assert "February 16, 2026" in rss
     assert "itunes" in rss.lower()
@@ -76,7 +76,7 @@ def test_add_episode_and_build_feed(tmp_path):
         assert catalog[0]["date"] == "2026-02-16"
 
         feed_content = feed_path.read_text()
-        assert "Noctua" in feed_content
+        assert "The Hootline" in feed_content
         assert "audio/mpeg" in feed_content
 
 

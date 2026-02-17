@@ -16,11 +16,25 @@ MAX_SOURCE_CHARS = 100_000
 PODCAST_PREAMBLE = """\
 **PODCAST PRODUCTION INSTRUCTIONS:**
 This document is organized into numbered segments. When generating the podcast:
+- Begin with a warm welcome and brief overview of today's topics
 - Present each segment in order, using the segment title as a transition
 - Spend roughly the suggested time on each segment (where noted)
 - Skip any segment that contains no articles
 - Use a conversational but informative tone throughout
 - Transition smoothly between segments with brief bridges
+- End with a brief wrap-up and sign-off
+"""
+
+INTRO_SECTION = """\
+## INTRO (~1 minute)
+Welcome to The Hootline, your daily knowledge briefing. Here's a quick look at \
+what we're covering today: {topics_preview}. Let's dive in.
+"""
+
+OUTRO_SECTION = """\
+## OUTRO (~1 minute)
+That's all for today's Hootline. Thanks for listening — we'll be back \
+tomorrow with more. Until then, stay curious.
 """
 
 
@@ -108,14 +122,20 @@ def _compile_text(
     for topic in SEGMENT_ORDER:
         ordered_articles.extend(grouped.get(topic.value, []))
 
-    preamble = f"# Noctua Daily Briefing — {date_str}\n\n\n{PODCAST_PREAMBLE}"
+    # Build topics preview for intro
+    active_topics = [t.value for t in SEGMENT_ORDER if grouped.get(t.value)]
+    topics_preview = ", ".join(active_topics[:-1]) + f", and {active_topics[-1]}" if len(active_topics) > 1 else active_topics[0] if active_topics else ""
+    intro = INTRO_SECTION.format(topics_preview=topics_preview)
+    outro = OUTRO_SECTION
+
+    preamble = f"# The Hootline — Daily Briefing — {date_str}\n\n\n{PODCAST_PREAMBLE}"
     # Estimate overhead per article: "### title\n\n*Source: name*\n\n...\n\n\n---\n"
     per_article_overhead = 80  # conservative average for headers/separators
     # Segment headers overhead
-    active_segments = sum(1 for t in SEGMENT_ORDER if grouped.get(t.value))
+    active_segments = len(active_topics)
     segment_overhead = active_segments * 60  # "## SEGMENT N: Topic (duration)\n\n"
 
-    fixed_overhead = len(preamble) + segment_overhead + (per_article_overhead * len(ordered_articles))
+    fixed_overhead = len(preamble) + len(intro) + len(outro) + segment_overhead + (per_article_overhead * len(ordered_articles))
     content_budget = max(MAX_SOURCE_CHARS - fixed_overhead, len(ordered_articles) * 200)
 
     # Allocate budget across articles
@@ -128,8 +148,9 @@ def _compile_text(
         )
 
     # Build the document
-    sections = [f"# Noctua Daily Briefing — {date_str}\n"]
+    sections = [f"# The Hootline — Daily Briefing — {date_str}\n"]
     sections.append(PODCAST_PREAMBLE)
+    sections.append(intro)
 
     segment_counts: dict[str, int] = {}
     segment_number = 0
@@ -161,6 +182,7 @@ def _compile_text(
             sections.append(content)
             sections.append("\n---\n")
 
+    sections.append(outro)
     text = "\n\n".join(sections)
 
     return text, segment_counts
@@ -178,9 +200,9 @@ def compile(digest: DailyDigest) -> CompiledDigest:
     if not digest.articles:
         raise DigestCompileError("No articles to compile.")
 
-    yesterday = datetime.now(UTC) - timedelta(days=1)
-    date_ymd = yesterday.strftime("%Y-%m-%d")
-    date_display = yesterday.strftime("%B %d, %Y")
+    today = datetime.now(UTC)
+    date_ymd = today.strftime("%Y-%m-%d")
+    date_display = today.strftime("%B %d, %Y")
 
     try:
         text, segment_counts = _compile_text(digest, date_display)

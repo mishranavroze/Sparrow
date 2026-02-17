@@ -26,23 +26,36 @@ class Topic(StrEnum):
     OTHER = "Other Newsletter Insights"
 
 
-# Ordered list for segment rendering
-SEGMENT_ORDER: list[Topic] = list(Topic)
+# Ordered list for segment rendering (priority order)
+SEGMENT_ORDER: list[Topic] = [
+    Topic.TECH_AI,
+    Topic.PRODUCT_MANAGEMENT,
+    Topic.WORLD_POLITICS,
+    Topic.US_POLITICS,
+    Topic.INDIAN_POLITICS,
+    Topic.CROSSFIT,
+    Topic.ENTERTAINMENT,
+    Topic.F1,
+    Topic.ARSENAL,
+    Topic.INDIAN_CRICKET,
+    Topic.BADMINTON,
+    Topic.OTHER,
+]
 
-# Suggested duration labels per segment
+# Suggested duration labels per segment (total: 30 minutes)
 SEGMENT_DURATIONS: dict[Topic, str] = {
-    Topic.WORLD_POLITICS: "~5 minutes",
-    Topic.US_POLITICS: "~5 minutes",
-    Topic.INDIAN_POLITICS: "~5 minutes",
-    Topic.TECH_AI: "",
-    Topic.ENTERTAINMENT: "",
-    Topic.PRODUCT_MANAGEMENT: "",
-    Topic.CROSSFIT: "",
-    Topic.F1: "",
-    Topic.ARSENAL: "",
-    Topic.INDIAN_CRICKET: "",
-    Topic.BADMINTON: "",
-    Topic.OTHER: "",
+    Topic.TECH_AI: "~5 minutes",
+    Topic.PRODUCT_MANAGEMENT: "~4 minutes",
+    Topic.WORLD_POLITICS: "~4 minutes",
+    Topic.US_POLITICS: "~3 minutes",
+    Topic.INDIAN_POLITICS: "~3 minutes",
+    Topic.ENTERTAINMENT: "~3 minutes",
+    Topic.CROSSFIT: "~2 minutes",
+    Topic.F1: "~2 minutes",
+    Topic.ARSENAL: "~1 minute",
+    Topic.INDIAN_CRICKET: "~1 minute",
+    Topic.BADMINTON: "~1 minute",
+    Topic.OTHER: "~1 minute",
 }
 
 # Transactional senders to filter out entirely
