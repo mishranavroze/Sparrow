@@ -22,8 +22,9 @@ class Settings(BaseSettings):
     notebooklm_notebook_url: str = ""
     chrome_user_data_dir: str = "~/.noctua-chrome-profile"
 
-    # Podcast generation
-    generation_hour: int = 18
+    # Podcast generation (schedule in UTC)
+    generation_hour: int = 7
+    generation_minute: int = 30
 
     # Serving
     base_url: str = "http://localhost:8000"

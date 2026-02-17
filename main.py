@@ -32,9 +32,9 @@ _next_scheduled_run: datetime | None = None
 
 
 def _calc_next_run() -> datetime:
-    """Calculate the next scheduled run time based on GENERATION_HOUR."""
+    """Calculate the next scheduled run time based on generation_hour and generation_minute."""
     now = datetime.now(UTC)
-    target = now.replace(hour=settings.generation_hour, minute=0, second=0, microsecond=0)
+    target = now.replace(hour=settings.generation_hour, minute=settings.generation_minute, second=0, microsecond=0)
     if target <= now:
         target += timedelta(days=1)
     return target
@@ -79,7 +79,7 @@ async def _scheduler() -> None:
 async def lifespan(app: FastAPI):
     """Start the background scheduler when the app starts."""
     task = asyncio.create_task(_scheduler())
-    logger.info("Background scheduler started (generation_hour=%d UTC).", settings.generation_hour)
+    logger.info("Background scheduler started (%02d:%02d UTC).", settings.generation_hour, settings.generation_minute)
     yield
     task.cancel()
     try:
@@ -378,7 +378,7 @@ async def health() -> dict:
         "feed_exists": feed_exists,
         "generation_running": _generation_running,
         "next_scheduled_run": _next_scheduled_run.isoformat() if _next_scheduled_run else None,
-        "generation_hour_utc": settings.generation_hour,
+        "generation_schedule_utc": f"{settings.generation_hour:02d}:{settings.generation_minute:02d}",
     }
 
 
