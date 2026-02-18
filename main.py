@@ -977,8 +977,11 @@ DASHBOARD_HTML = """\
 </div>
 
 <div id="tab-history" class="tab-content">
-  <div class="history-wrap" id="hist-content">
-    <div class="empty"><p>Loading history...</p></div>
+  <div class="latest-layout">
+    <div class="latest-left" id="hist-content">
+      <div class="empty"><p>Loading history...</p></div>
+    </div>
+    <div class="latest-right" id="hist-radar"></div>
   </div>
 </div>
 
@@ -1168,7 +1171,7 @@ async function loadHistory() {
     const data = await histRes.json();
     const pendingWeeks = await weeksRes.json();
 
-    if ((!data.rows || data.rows.length===0) && pendingWeeks.length===0) { box.innerHTML='<div class="empty"><p>No digests yet.</p></div>'; return; }
+    if ((!data.rows || data.rows.length===0) && pendingWeeks.length===0) { box.innerHTML='<div class="empty"><p>No digests yet.</p></div>'; loadRadar('cumulative', 'hist-radar'); return; }
 
     const week = getWeekRange();
     const thisWeek = (data.rows||[]).filter(r => r.has_audio && r.date >= week.mon && r.date <= week.sun);
@@ -1199,7 +1202,6 @@ async function loadHistory() {
       h += '</div></div>';
     }
 
-    h += '<div id="hist-radar" style="margin-bottom:24px;max-width:540px;"></div>';
     h += '<table class="htable"><thead><tr><th>Date</th><th>Digest</th><th>Audio</th><th>Digest Details</th><th>Audio Details</th></tr></thead><tbody>';
     for (const r of data.rows) {
       const dt = new Date(r.date+'T00:00:00');
