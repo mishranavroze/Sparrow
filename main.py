@@ -470,10 +470,13 @@ async def api_export_weeks():
     for z in zips:
         # Extract week label from filename: hootline-W08-2026.zip -> W08-2026
         label = z.stem.removeprefix("hootline-")
+        stat = z.stat()
+        created = datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat()
         result.append({
             "filename": z.name,
-            "size_bytes": z.stat().st_size,
+            "size_bytes": stat.st_size,
             "week_label": label,
+            "created_at": created,
         })
     return JSONResponse(result)
 
@@ -945,7 +948,7 @@ DASHBOARD_HTML = """\
 </div>
 
 <script>
-let radarMode = 'cumulative';
+let radarMode = 'latest';
 
 function switchTab(tab) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -1006,7 +1009,7 @@ async function loadLatest() {
 
 // ===== RADAR =====
 async function loadRadar(mode) {
-  radarMode = mode || 'cumulative';
+  radarMode = mode || 'latest';
   const box = document.getElementById('right-col');
   try {
     const res = await fetch('/api/topic-coverage?mode=' + radarMode);
@@ -1016,8 +1019,8 @@ async function loadRadar(mode) {
 
     let h = '<div class="radar-card"><div class="radar-hdr"><div class="card-label">Topic Coverage</div>';
     h += '<div class="radar-toggle">';
-    h += '<button class="' + (radarMode==='cumulative'?'active':'') + '" onclick="loadRadar(\\'cumulative\\')">All Time</button>';
     h += '<button class="' + (radarMode==='latest'?'active':'') + '" onclick="loadRadar(\\'latest\\')">Latest</button>';
+    h += '<button class="' + (radarMode==='cumulative'?'active':'') + '" onclick="loadRadar(\\'cumulative\\')">All Time</button>';
     h += '</div></div>';
     h += '<canvas id="radar-cv" width="500" height="500" style="display:block;margin:0 auto;"></canvas>';
     h += '<div class="radar-legend"><span><span class="sw" style="background:rgba(196,160,82,0.6);"></span>Target (100%)</span>';
@@ -1150,8 +1153,11 @@ async function loadHistory() {
       h += '<div style="display:flex;flex-direction:column;gap:6px;margin-top:8px;">';
       for (const w of pendingWeeks) {
         const mb = (w.size_bytes / 1048576).toFixed(1);
+        const ts = w.created_at ? new Date(w.created_at).toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '';
         h += '<div style="display:flex;align-items:center;justify-content:space-between;">';
-        h += '<span style="font-size:12px;color:var(--text);">' + esc(w.week_label) + ' &middot; ' + mb + ' MB</span>';
+        h += '<span style="font-size:12px;color:var(--text);">' + esc(w.week_label) + ' &middot; ' + mb + ' MB';
+        if (ts) h += ' &middot; <span style="color:var(--text-dim);">' + esc(ts) + '</span>';
+        h += '</span>';
         h += '<a class="btn" href="/api/download-export/' + encodeURIComponent(w.filename) + '">Download</a>';
         h += '</div>';
       }
