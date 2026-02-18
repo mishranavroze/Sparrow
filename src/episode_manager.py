@@ -7,6 +7,7 @@ from pathlib import Path
 
 from mutagen.mp3 import MP3
 
+from src import gcs_storage
 from src.exceptions import EpisodeProcessError
 from src.models import EpisodeMetadata
 
@@ -87,12 +88,13 @@ def _cleanup_old_episodes() -> None:
             ep.unlink()
 
 
-def process(mp3_path: Path, topics_summary: str) -> EpisodeMetadata:
+def process(mp3_path: Path, topics_summary: str, rss_summary: str = "") -> EpisodeMetadata:
     """Validate a downloaded MP3 and extract metadata.
 
     Args:
         mp3_path: Path to the downloaded MP3 file.
         topics_summary: Brief summary of episode topics.
+        rss_summary: Short (~15 word) description for the RSS feed.
 
     Returns:
         EpisodeMetadata with duration, file size, etc.
@@ -138,6 +140,14 @@ def process(mp3_path: Path, topics_summary: str) -> EpisodeMetadata:
             file_size / (1024 * 1024),
         )
 
+        # Upload to GCS for permanent storage (before cleanup deletes old files)
+        gcs_url = ""
+        if gcs_storage.is_configured():
+            try:
+                gcs_url = gcs_storage.upload_episode(canonical_path, date_str)
+            except Exception as e:
+                logger.error("GCS upload failed (continuing without): %s", e)
+
         # Clean up old episodes
         _cleanup_old_episodes()
 
@@ -148,6 +158,8 @@ def process(mp3_path: Path, topics_summary: str) -> EpisodeMetadata:
             duration_seconds=duration_seconds,
             duration_formatted=duration_formatted,
             topics_summary=topics_summary,
+            rss_summary=rss_summary,
+            gcs_url=gcs_url,
         )
 
     except EpisodeProcessError:

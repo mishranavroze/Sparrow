@@ -31,6 +31,8 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             article_count INTEGER NOT NULL DEFAULT 0,
             total_words INTEGER NOT NULL DEFAULT 0,
             topics_summary TEXT NOT NULL DEFAULT '',
+            rss_summary TEXT NOT NULL DEFAULT '',
+            segment_counts TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL
         );
 
@@ -45,30 +47,62 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             steps_log TEXT NOT NULL DEFAULT '[]'
         );
 
+        CREATE TABLE IF NOT EXISTS episodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT UNIQUE NOT NULL,
+            file_size_bytes INTEGER NOT NULL,
+            duration_seconds INTEGER NOT NULL,
+            duration_formatted TEXT NOT NULL,
+            topics_summary TEXT NOT NULL DEFAULT '',
+            rss_summary TEXT NOT NULL DEFAULT '',
+            gcs_url TEXT NOT NULL DEFAULT '',
+            published_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_digests_date ON digests(date);
+        CREATE INDEX IF NOT EXISTS idx_episodes_date ON episodes(date);
         CREATE INDEX IF NOT EXISTS idx_runs_started ON pipeline_runs(started_at);
     """)
+    # Migrate: add rss_summary column if missing (existing DBs)
+    try:
+        conn.execute("ALTER TABLE digests ADD COLUMN rss_summary TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    # Migrate: add segment_counts column to digests if missing
+    try:
+        conn.execute("ALTER TABLE digests ADD COLUMN segment_counts TEXT NOT NULL DEFAULT '{}'")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    # Migrate: add gcs_url column to episodes if missing
+    try:
+        conn.execute("ALTER TABLE episodes ADD COLUMN gcs_url TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
 
 
 # --- Digest CRUD ---
 
 def save_digest(date: str, markdown_text: str, article_count: int,
-                total_words: int, topics_summary: str) -> None:
+                total_words: int, topics_summary: str, rss_summary: str = "",
+                segment_counts: dict[str, int] | None = None) -> None:
     """Save or update a daily digest."""
     conn = _get_connection()
     try:
         conn.execute(
             """INSERT INTO digests (date, markdown_text, article_count, total_words,
-               topics_summary, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)
+               topics_summary, rss_summary, segment_counts, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(date) DO UPDATE SET
                markdown_text=excluded.markdown_text,
                article_count=excluded.article_count,
                total_words=excluded.total_words,
                topics_summary=excluded.topics_summary,
+               rss_summary=excluded.rss_summary,
+               segment_counts=excluded.segment_counts,
                created_at=excluded.created_at""",
             (date, markdown_text, article_count, total_words, topics_summary,
+             rss_summary, json.dumps(segment_counts or {}),
              datetime.now(UTC).isoformat()),
         )
         conn.commit()
@@ -98,6 +132,66 @@ def list_digests(limit: int = 50) -> list[dict]:
             "FROM digests ORDER BY date DESC LIMIT ?",
             (limit,),
         ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_topic_coverage(limit: int = 30) -> list[dict]:
+    """Get segment_counts from recent digests for topic coverage analysis."""
+    conn = _get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT date, segment_counts FROM digests ORDER BY date DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["segment_counts"] = json.loads(d["segment_counts"])
+            result.append(d)
+        return result
+    finally:
+        conn.close()
+
+
+# --- Episode Archive ---
+
+def save_episode(date: str, file_size_bytes: int, duration_seconds: int,
+                 duration_formatted: str, topics_summary: str,
+                 rss_summary: str = "", gcs_url: str = "") -> None:
+    """Permanently archive an episode. This record is never deleted."""
+    conn = _get_connection()
+    try:
+        conn.execute(
+            """INSERT INTO episodes (date, file_size_bytes, duration_seconds,
+               duration_formatted, topics_summary, rss_summary, gcs_url, published_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(date) DO UPDATE SET
+               file_size_bytes=excluded.file_size_bytes,
+               duration_seconds=excluded.duration_seconds,
+               duration_formatted=excluded.duration_formatted,
+               topics_summary=excluded.topics_summary,
+               rss_summary=excluded.rss_summary,
+               gcs_url=excluded.gcs_url,
+               published_at=excluded.published_at""",
+            (date, file_size_bytes, duration_seconds, duration_formatted,
+             topics_summary, rss_summary, gcs_url, datetime.now(UTC).isoformat()),
+        )
+        conn.commit()
+        logger.info("Archived episode for %s", date)
+    finally:
+        conn.close()
+
+
+def list_episodes(limit: int = 0) -> list[dict]:
+    """List all archived episodes (most recent first). No limit by default."""
+    conn = _get_connection()
+    try:
+        query = "SELECT * FROM episodes ORDER BY date DESC"
+        if limit > 0:
+            query += f" LIMIT {limit}"
+        rows = conn.execute(query).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()

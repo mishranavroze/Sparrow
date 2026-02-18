@@ -48,7 +48,8 @@
       "Bash(python -m generate:*)",
       "Bash(wc:*)",
       "Bash(pkill:*)",
-      "Bash(lsof:*)"
+      "Bash(lsof:*)",
+      "Bash(grep:*)"
     ]
   }
 }

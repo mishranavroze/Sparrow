@@ -85,6 +85,8 @@ async def generate_digest_only() -> CompiledDigest | None:
                 article_count=compiled.article_count,
                 total_words=compiled.total_words,
                 topics_summary=compiled.topics_summary,
+                rss_summary=compiled.rss_summary,
+                segment_counts=compiled.segment_counts,
             )
 
             msg = (

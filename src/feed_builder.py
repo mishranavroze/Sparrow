@@ -8,6 +8,7 @@ from pathlib import Path
 from feedgen.feed import FeedGenerator
 
 from config import settings
+from src import database
 from src.exceptions import FeedBuildError
 from src.models import EpisodeMetadata
 
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 FEED_PATH = Path("output/feed.xml")
 EPISODES_JSON = Path("output/episodes.json")
 MAX_FEED_EPISODES = 30
+FALLBACK_RSS_DESCRIPTION = "Your nightly knowledge briefing from The Hootline."
 
 
 def _load_episode_catalog() -> list[dict]:
@@ -68,11 +70,13 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
     # Add episodes (most recent first)
     for ep in sorted(episodes, key=lambda e: e["date"], reverse=True)[:MAX_FEED_EPISODES]:
         fe = fg.add_entry()
-        # Use revision suffix in GUID/URL to force podcast platforms to
-        # re-download when an episode file is replaced.
-        revision = ep.get("revision", 1)
-        rev_suffix = f"?v={revision}" if revision > 1 else ""
-        mp3_url = f"{settings.base_url}/episodes/noctua-{ep['date']}.mp3{rev_suffix}"
+        # Use GCS URL if available, otherwise fall back to local URL
+        if ep.get("gcs_url"):
+            mp3_url = ep["gcs_url"]
+        else:
+            revision = ep.get("revision", 1)
+            rev_suffix = f"?v={revision}" if revision > 1 else ""
+            mp3_url = f"{settings.base_url}/episodes/noctua-{ep['date']}.mp3{rev_suffix}"
 
         fe.id(mp3_url)
 
@@ -84,7 +88,7 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
             display_date = ep["date"]
 
         fe.title(display_date)
-        fe.description(ep.get("topics_summary", "Daily knowledge briefing."))
+        fe.description(ep.get("rss_summary") or FALLBACK_RSS_DESCRIPTION)
         fe.published(
             datetime.fromisoformat(ep["published"]) if "published" in ep
             else datetime.now(UTC)
@@ -95,7 +99,7 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
 
         # Podcast extensions
         fe.podcast.itunes_duration(ep.get("duration_formatted", "00:00:00"))
-        fe.podcast.itunes_summary(ep.get("topics_summary", ""))
+        fe.podcast.itunes_summary(ep.get("rss_summary") or FALLBACK_RSS_DESCRIPTION)
         fe.podcast.itunes_explicit("no")
 
     return fg
@@ -113,20 +117,35 @@ def add_episode(metadata: EpisodeMetadata) -> None:
         # Remove existing entry for the same date (re-generation)
         episodes = [e for e in episodes if e["date"] != metadata.date]
 
-        episodes.append({
+        entry = {
             "date": metadata.date,
             "file_size_bytes": metadata.file_size_bytes,
             "duration_seconds": metadata.duration_seconds,
             "duration_formatted": metadata.duration_formatted,
             "topics_summary": metadata.topics_summary,
+            "rss_summary": metadata.rss_summary,
             "published": datetime.now(UTC).isoformat(),
-        })
+        }
+        if metadata.gcs_url:
+            entry["gcs_url"] = metadata.gcs_url
+        episodes.append(entry)
 
         # Keep only the most recent episodes
         episodes = sorted(episodes, key=lambda e: e["date"], reverse=True)[:MAX_FEED_EPISODES]
 
         _save_episode_catalog(episodes)
         build_feed()
+
+        # Permanent archive (no limit)
+        database.save_episode(
+            date=metadata.date,
+            file_size_bytes=metadata.file_size_bytes,
+            duration_seconds=metadata.duration_seconds,
+            duration_formatted=metadata.duration_formatted,
+            topics_summary=metadata.topics_summary,
+            rss_summary=metadata.rss_summary,
+            gcs_url=metadata.gcs_url,
+        )
 
         logger.info("Added episode for %s to feed", metadata.date)
 

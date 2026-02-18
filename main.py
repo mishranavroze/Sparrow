@@ -159,9 +159,10 @@ async def api_latest_episode():
         episodes = json.loads(EPISODES_JSON.read_text())
         if episodes:
             latest = sorted(episodes, key=lambda e: e["date"], reverse=True)[0]
+            audio_url = latest.get("gcs_url") or f"/episodes/noctua-{latest['date']}.mp3"
             episode_data = {
                 **latest,
-                "audio_url": f"/episodes/noctua-{latest['date']}.mp3",
+                "audio_url": audio_url,
             }
 
     # Get the most recent digest (independent of episode date)
@@ -183,6 +184,113 @@ async def api_latest_episode():
         "episode": episode_data,
         "digest": digest_meta,
     })
+
+
+@app.get("/api/episodes")
+async def api_episodes():
+    """Get the full archive of all episodes ever published."""
+    episodes = database.list_episodes()
+    return JSONResponse({"episodes": episodes, "total": len(episodes)})
+
+
+@app.get("/api/topic-coverage")
+async def api_topic_coverage(mode: str = Query("cumulative")):
+    """Radar chart data: target vs actual topic coverage with suggestions.
+
+    Args:
+        mode: "cumulative" for all digests, "latest" for most recent only.
+    """
+    from src.topic_classifier import SEGMENT_DURATIONS, SEGMENT_ORDER
+
+    # Target percentages from segment durations
+    duration_map = {}
+    for topic, dur_str in SEGMENT_DURATIONS.items():
+        minutes = int(dur_str.replace("~", "").replace(" minutes", "").replace(" minute", ""))
+        duration_map[topic.value] = minutes
+    total_minutes = sum(duration_map.values())
+    targets = {t: (m / total_minutes) * 100 for t, m in duration_map.items()}
+
+    # Actual coverage from recent digests
+    limit = 1 if mode == "latest" else 30
+    digests = database.get_topic_coverage(limit=limit)
+    totals: dict[str, int] = {}
+    for d in digests:
+        for topic_name, count in d["segment_counts"].items():
+            totals[topic_name] = totals.get(topic_name, 0) + count
+    grand_total = sum(totals.values())
+    has_data = grand_total > 0
+    if grand_total == 0:
+        grand_total = 1  # avoid division by zero
+    actuals = {t.value: (totals.get(t.value, 0) / grand_total) * 100 for t in SEGMENT_ORDER}
+
+    # Build ordered topic list for the radar chart
+    topics = []
+    for topic in SEGMENT_ORDER:
+        name = topic.value
+        target_pct = targets.get(name, 0)
+        actual_pct = actuals.get(name, 0)
+        gap = actual_pct - target_pct
+        topics.append({
+            "name": name,
+            "target_pct": round(target_pct, 1),
+            "actual_pct": round(actual_pct, 1),
+            "actual_articles": totals.get(name, 0),
+            "gap": round(gap, 1),
+        })
+
+    # Suggestions (only when we have actual data)
+    suggestions = []
+    if has_data:
+        for t in topics:
+            if t["gap"] < -3:
+                suggestions.append({
+                    "topic": t["name"],
+                    "action": "subscribe",
+                    "reason": f"Under-covered by {abs(t['gap']):.0f}pp — consider adding sources",
+                })
+            elif t["gap"] > 5:
+                suggestions.append({
+                    "topic": t["name"],
+                    "action": "unsubscribe",
+                    "reason": f"Over-covered by {t['gap']:.0f}pp — consider reducing sources",
+                })
+
+    return JSONResponse({
+        "topics": topics,
+        "suggestions": suggestions,
+        "digests_analyzed": len(digests),
+        "total_articles": sum(totals.values()),
+        "has_data": has_data,
+        "mode": mode,
+    })
+
+
+@app.get("/api/history")
+async def api_history():
+    """Combined digest + episode history for the History tab."""
+    digests = database.list_digests(limit=100)
+    episodes_list = database.list_episodes()
+    ep_by_date = {ep["date"]: ep for ep in episodes_list}
+
+    rows = []
+    for d in digests:
+        ep = ep_by_date.get(d["date"])
+        full = database.get_digest(d["date"])
+        rows.append({
+            "date": d["date"],
+            "article_count": d["article_count"],
+            "total_words": d["total_words"],
+            "total_chars": len(full["markdown_text"]) if full else 0,
+            "topics_summary": d["topics_summary"],
+            "has_digest": True,
+            "has_audio": ep is not None,
+            "duration_formatted": ep["duration_formatted"] if ep else None,
+            "file_size_bytes": ep["file_size_bytes"] if ep else None,
+            "rss_summary": ep.get("rss_summary", "") if ep else "",
+            "gcs_url": ep.get("gcs_url", "") if ep else "",
+        })
+
+    return JSONResponse({"rows": rows, "total": len(rows)})
 
 
 @app.get("/digests/{date}.md")
@@ -380,7 +488,8 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
     # Process episode (validate MP3, extract metadata)
     try:
         topics_summary = digest.get("topics_summary", "")
-        metadata = episode_manager.process(mp3_path, topics_summary)
+        rss_summary = digest.get("rss_summary", "")
+        metadata = episode_manager.process(mp3_path, topics_summary, rss_summary)
     except Exception as e:
         mp3_path.unlink(missing_ok=True)
         return JSONResponse(
@@ -406,6 +515,7 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
             "duration_formatted": metadata.duration_formatted,
             "file_size_bytes": metadata.file_size_bytes,
             "topics_summary": metadata.topics_summary,
+            "gcs_url": metadata.gcs_url,
         },
     })
 
@@ -461,231 +571,135 @@ DASHBOARD_HTML = """\
     min-height: 100vh;
   }
 
+  /* Header */
   header {
     border-bottom: 1px solid var(--border);
-    padding: 16px 24px;
+    padding: 12px 24px;
     display: flex;
     align-items: center;
     justify-content: space-between;
   }
-
-  header h1 {
-    font-size: 18px;
-    font-weight: 600;
-    color: var(--accent);
-    letter-spacing: 2px;
-  }
-
-  header .tagline {
-    font-size: 11px;
-    color: var(--text-dim);
-    font-style: italic;
-  }
-
-  header .header-actions {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
+  header h1 { font-size: 18px; font-weight: 600; color: var(--accent); letter-spacing: 2px; }
+  header .tagline { font-size: 11px; color: var(--text-dim); font-style: italic; }
+  header .actions { display: flex; align-items: center; gap: 8px; }
 
   .btn {
-    font-size: 12px;
-    color: var(--accent);
-    text-decoration: none;
-    border: 1px solid var(--accent-dim);
-    padding: 4px 12px;
-    border-radius: 4px;
-    cursor: pointer;
-    background: transparent;
-    font-family: inherit;
+    font-size: 12px; color: var(--accent); text-decoration: none;
+    border: 1px solid var(--accent-dim); padding: 4px 12px; border-radius: 4px;
+    cursor: pointer; background: transparent; font-family: inherit;
   }
   .btn:hover { background: var(--accent-dim); color: var(--bg); }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .btn:disabled:hover { background: transparent; color: var(--accent); }
 
-  .scheduler-info {
-    font-size: 10px;
-    color: var(--text-dim);
-    text-align: right;
+  /* Tabs */
+  .tab-bar { display: flex; border-bottom: 1px solid var(--border); padding: 0 24px; }
+  .tab-btn {
+    font-family: inherit; font-size: 12px; font-weight: 500; color: var(--text-dim);
+    background: none; border: none; padding: 10px 20px; cursor: pointer;
+    border-bottom: 2px solid transparent; letter-spacing: 1px; text-transform: uppercase;
   }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
 
-  /* Main layout */
-  .page {
-    max-width: 860px;
-    margin: 0 auto;
-    padding: 32px 24px;
-  }
+  /* Latest: two-column */
+  .latest-layout { display: flex; gap: 24px; max-width: 1200px; margin: 0 auto; padding: 24px; align-items: flex-start; }
+  .latest-left { flex: 1; min-width: 0; }
+  .latest-right { width: 420px; flex-shrink: 0; }
 
-  /* Episode player card */
-  .episode-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 28px;
-    margin-bottom: 32px;
+  /* Card */
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 24px; margin-bottom: 16px;
   }
+  .card-label { font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--accent); margin-bottom: 8px; }
 
-  .episode-card .episode-date {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    color: var(--accent);
-    margin-bottom: 8px;
-  }
+  /* Episode */
+  .ep-title { font-size: 20px; font-weight: 600; margin-bottom: 6px; }
+  .ep-desc { font-size: 13px; margin-bottom: 8px; line-height: 1.4; }
+  .ep-meta { font-size: 11px; color: var(--text-dim); margin-bottom: 16px; display: flex; gap: 12px; flex-wrap: wrap; }
+  .card audio { width: 100%; height: 44px; border-radius: 8px; }
 
-  .episode-card .episode-title {
-    font-size: 22px;
-    font-weight: 600;
-    color: var(--text);
-    margin-bottom: 6px;
+  /* Digest */
+  .digest-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+  .digest-stats { font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
+  .digest-topics { font-size: 11px; color: var(--text-dim); line-height: 1.5; }
+  .dl-btn {
+    flex-shrink: 0; font-size: 12px; color: var(--bg); background: var(--accent);
+    border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer;
+    font-family: inherit; font-weight: 500; text-decoration: none; white-space: nowrap;
   }
+  .dl-btn:hover { background: var(--accent-dim); }
 
-  .episode-card .episode-meta {
-    font-size: 12px;
-    color: var(--text-dim);
-    margin-bottom: 20px;
-    display: flex;
-    gap: 16px;
+  /* Upload */
+  .upload-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .upload-row input[type="file"] { font-family: inherit; font-size: 12px; color: var(--text-dim); flex: 1; min-width: 180px; }
+  .up-btn {
+    font-size: 12px; color: var(--bg); background: var(--accent); border: none;
+    padding: 8px 18px; border-radius: 6px; cursor: pointer; font-family: inherit; font-weight: 500;
   }
+  .up-btn:hover { background: var(--accent-dim); }
+  .up-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .upload-status { font-size: 12px; margin-top: 8px; }
+  .upload-status.error { color: var(--red); }
+  .upload-status.success { color: var(--green); }
 
-  .episode-card audio {
-    width: 100%;
-    height: 48px;
-    border-radius: 8px;
-    outline: none;
+  /* Radar */
+  .radar-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+  .radar-hdr { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .radar-hdr .card-label { margin-bottom: 0; }
+  .radar-toggle { display: flex; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  .radar-toggle button {
+    font-family: inherit; font-size: 10px; padding: 4px 10px; border: none;
+    background: none; color: var(--text-dim); cursor: pointer;
   }
+  .radar-toggle button.active { background: var(--accent-dim); color: var(--bg); }
+  .radar-legend { display: flex; gap: 16px; justify-content: center; margin: 10px 0; font-size: 10px; color: var(--text-dim); }
+  .radar-legend .sw { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+  .radar-stats { font-size: 10px; color: var(--text-dim); text-align: center; margin-bottom: 8px; }
 
-  /* Digest download card */
-  .digest-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 24px 28px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 20px;
-  }
+  /* Suggestions */
+  .sug-label { font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--accent); margin: 12px 0 8px; }
+  .sug-item { font-size: 11px; padding: 6px 10px; border-radius: 5px; margin-bottom: 4px; display: flex; align-items: flex-start; gap: 6px; }
+  .sug-item.subscribe { background: rgba(74,222,128,0.08); border: 1px solid rgba(74,222,128,0.2); color: var(--green); }
+  .sug-item.unsubscribe { background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.2); color: var(--red); }
+  .sug-item .pill { font-size: 9px; padding: 1px 5px; border-radius: 3px; font-weight: 600; text-transform: uppercase; flex-shrink: 0; margin-top: 1px; }
+  .sug-item.subscribe .pill { background: rgba(74,222,128,0.15); }
+  .sug-item.unsubscribe .pill { background: rgba(248,113,113,0.15); }
+  .no-sug { font-size: 11px; color: var(--text-dim); font-style: italic; }
 
-  .digest-card .digest-info {
-    flex: 1;
+  /* History */
+  .history-wrap { max-width: 1200px; margin: 0 auto; padding: 24px; }
+  .htable { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .htable th {
+    text-align: left; color: var(--text-dim); font-weight: 500; padding: 8px 12px;
+    border-bottom: 1px solid var(--border); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; white-space: nowrap;
   }
-
-  .digest-card .digest-label {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    color: var(--accent);
-    margin-bottom: 6px;
-  }
-
-  .digest-card .digest-stats {
-    font-size: 12px;
-    color: var(--text-dim);
-    margin-bottom: 4px;
-  }
-
-  .digest-card .digest-topics {
-    font-size: 12px;
-    color: var(--text-dim);
-    line-height: 1.5;
-  }
-
-  .digest-card .download-btn {
-    flex-shrink: 0;
-    font-size: 12px;
-    color: var(--bg);
-    background: var(--accent);
-    border: none;
-    padding: 8px 20px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-family: inherit;
-    font-weight: 500;
-    text-decoration: none;
-    white-space: nowrap;
-  }
-  .digest-card .download-btn:hover { background: var(--accent-dim); }
-
-  /* Upload section */
-  .upload-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 24px 28px;
-    margin-top: 16px;
-  }
-
-  .upload-card .upload-label {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 1.5px;
-    color: var(--accent);
-    margin-bottom: 12px;
-  }
-
-  .upload-card .upload-row {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    flex-wrap: wrap;
-  }
-
-  .upload-card input[type="file"] {
-    font-family: inherit;
-    font-size: 12px;
-    color: var(--text-dim);
-    flex: 1;
-    min-width: 200px;
-  }
-
-  .upload-card .upload-btn {
-    font-size: 12px;
-    color: var(--bg);
-    background: var(--accent);
-    border: none;
-    padding: 8px 20px;
-    border-radius: 6px;
-    cursor: pointer;
-    font-family: inherit;
-    font-weight: 500;
-    white-space: nowrap;
-  }
-  .upload-card .upload-btn:hover { background: var(--accent-dim); }
-  .upload-card .upload-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-
-  .upload-card .upload-status {
-    font-size: 12px;
-    margin-top: 10px;
-    line-height: 1.5;
-  }
-  .upload-card .upload-status.error { color: var(--red); }
-  .upload-card .upload-status.success { color: var(--green); }
+  .htable td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .htable tr:hover td { background: var(--surface); }
+  .h-date { font-weight: 500; white-space: nowrap; }
+  .h-link { text-decoration: none; font-size: 11px; }
+  .h-link.digest { color: var(--accent); }
+  .h-link.audio { color: var(--blue); }
+  .h-link:hover { text-decoration: underline; }
+  .h-detail { font-size: 11px; color: var(--text-dim); line-height: 1.5; }
+  .h-badge { display: inline-block; font-size: 9px; padding: 1px 5px; border-radius: 3px; font-weight: 600; text-transform: uppercase; }
+  .h-badge.yes { background: rgba(74,222,128,0.15); color: var(--green); }
+  .h-badge.no { background: rgba(248,113,113,0.08); color: var(--text-dim); }
 
   /* Empty state */
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    min-height: 60vh;
-    color: var(--text-dim);
-    text-align: center;
-    padding: 40px;
-  }
+  .empty { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 50vh; color: var(--text-dim); text-align: center; padding: 40px; }
+  .empty .owl { font-size: 56px; margin-bottom: 20px; opacity: 0.4; }
+  .empty p { font-size: 13px; line-height: 1.7; max-width: 400px; }
 
-  .empty-state .owl { font-size: 56px; margin-bottom: 20px; opacity: 0.4; }
-  .empty-state p { font-size: 13px; line-height: 1.7; max-width: 400px; }
-
-  /* Scrollbar */
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
-  @media (max-width: 640px) {
-    .page { padding: 20px 16px; }
-    .episode-card { padding: 20px; }
-    .episode-card .episode-title { font-size: 18px; }
-    .episode-card .episode-meta { flex-direction: column; gap: 4px; }
+  @media (max-width: 860px) {
+    .latest-layout { flex-direction: column; }
+    .latest-right { width: 100%; }
   }
 </style>
 </head>
@@ -696,184 +710,286 @@ DASHBOARD_HTML = """\
     <h1>THE HOOTLINE</h1>
     <div class="tagline">The owl of Minerva spreads its wings only with the falling of dusk.</div>
   </div>
-  <div class="header-actions">
-    <div class="scheduler-info" id="scheduler-info"></div>
-    <button class="btn" id="generate-btn" onclick="triggerGenerate()">Prepare Digest</button>
+  <div class="actions">
+    <span style="font-size:10px;color:var(--text-dim);" id="sched-info"></span>
+    <button class="btn" id="gen-btn" onclick="triggerGen()">Prepare Digest</button>
     <a class="btn" href="/feed.xml">RSS Feed</a>
   </div>
 </header>
 
-<div class="page" id="page">
-  <div class="empty-state" id="loading">
-    <div class="owl">&#x1F989;</div>
-    <p>Loading...</p>
+<div class="tab-bar">
+  <button class="tab-btn active" onclick="switchTab('latest')">Latest</button>
+  <button class="tab-btn" onclick="switchTab('history')">History</button>
+</div>
+
+<div id="tab-latest" class="tab-content active">
+  <div class="latest-layout">
+    <div class="latest-left" id="left-col">
+      <div class="empty"><div class="owl">&#x1F989;</div><p>Loading...</p></div>
+    </div>
+    <div class="latest-right" id="right-col"></div>
+  </div>
+</div>
+
+<div id="tab-history" class="tab-content">
+  <div class="history-wrap" id="hist-content">
+    <div class="empty"><p>Loading history...</p></div>
   </div>
 </div>
 
 <script>
-  async function load() {
-    const res = await fetch('/api/latest-episode');
+let radarMode = 'cumulative';
+
+function switchTab(tab) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  event.target.classList.add('active');
+  document.getElementById('tab-' + tab).classList.add('active');
+  if (tab === 'history') loadHistory();
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ===== LATEST TAB =====
+async function loadLatest() {
+  const res = await fetch('/api/latest-episode');
+  const data = await res.json();
+  const left = document.getElementById('left-col');
+
+  if (!data.episode && !data.digest) {
+    left.innerHTML = '<div class="empty"><div class="owl">&#x1F989;</div><p>No episodes yet.<br>Click <strong>Prepare Digest</strong> to fetch today\\'s newsletters, then upload audio from NotebookLM.</p></div>';
+    document.getElementById('right-col').innerHTML = '';
+    return;
+  }
+
+  let h = '';
+
+  if (data.episode) {
+    const ep = data.episode;
+    const dt = new Date(ep.date + 'T00:00:00');
+    const dd = dt.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+    const mb = (ep.file_size_bytes / 1048576).toFixed(1);
+    h += '<div class="card"><div class="card-label">Latest Episode</div>';
+    h += '<div class="ep-title">The Hootline &mdash; ' + esc(dd) + '</div>';
+    if (ep.rss_summary) h += '<div class="ep-desc">' + esc(ep.rss_summary) + '</div>';
+    h += '<div class="ep-meta"><span>' + (ep.duration_formatted||'') + '</span><span>' + mb + ' MB</span><span>' + esc(ep.topics_summary||'') + '</span></div>';
+    h += '<audio controls preload="metadata" src="' + ep.audio_url + '"></audio></div>';
+  }
+
+  if (data.digest) {
+    const d = data.digest;
+    h += '<div class="card"><div class="card-label">Today\\'s Digest</div><div class="digest-row"><div>';
+    h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + d.total_words.toLocaleString() + ' words &middot; ' + d.total_chars.toLocaleString() + ' chars</div>';
+    h += '<div class="digest-topics">' + esc(d.topics_summary||'') + '</div>';
+    h += '</div><a class="dl-btn" href="' + d.download_url + '" download>Download .md</a></div></div>';
+
+    h += '<div class="card"><div class="card-label">Upload Episode MP3</div>';
+    h += '<div class="upload-row"><input type="file" id="mp3-file" accept=".mp3,.m4a,.wav,.ogg,.webm,audio/*">';
+    h += '<button class="up-btn" id="up-btn" onclick="uploadEp(\\'' + esc(d.date) + '\\')">Upload</button></div>';
+    h += '<div class="upload-status" id="up-status"></div></div>';
+  }
+
+  left.innerHTML = h;
+  loadRadar(radarMode);
+}
+
+// ===== RADAR =====
+async function loadRadar(mode) {
+  radarMode = mode || 'cumulative';
+  const box = document.getElementById('right-col');
+  try {
+    const res = await fetch('/api/topic-coverage?mode=' + radarMode);
     const data = await res.json();
-    const page = document.getElementById('page');
+    const topics = data.topics;
+    if (!topics) { box.innerHTML = ''; return; }
 
-    if (!data.episode && !data.digest) {
-      page.innerHTML = `
-        <div class="empty-state">
-          <div class="owl">&#x1F989;</div>
-          <p>No episodes yet.<br>Click <strong>Prepare Digest</strong> to fetch and compile today's newsletters, then upload the audio from NotebookLM.</p>
-        </div>`;
-      return;
-    }
+    let h = '<div class="radar-card"><div class="radar-hdr"><div class="card-label">Topic Coverage</div>';
+    h += '<div class="radar-toggle">';
+    h += '<button class="' + (radarMode==='cumulative'?'active':'') + '" onclick="loadRadar(\\'cumulative\\')">All Time</button>';
+    h += '<button class="' + (radarMode==='latest'?'active':'') + '" onclick="loadRadar(\\'latest\\')">Latest</button>';
+    h += '</div></div>';
+    h += '<canvas id="radar-cv" width="380" height="380" style="display:block;margin:0 auto;"></canvas>';
+    h += '<div class="radar-legend"><span><span class="sw" style="background:rgba(196,160,82,0.6);"></span>Target</span>';
+    h += '<span><span class="sw" style="background:rgba(96,165,250,0.6);"></span>Actual</span></div>';
+    const lbl = radarMode==='latest' ? 'latest digest' : data.digests_analyzed + ' digests';
+    h += '<div class="radar-stats">' + lbl + ' &middot; ' + data.total_articles + ' articles' + (!data.has_data?' &middot; no coverage data yet':'') + '</div>';
 
-    let html = '';
-
-    // Episode player card
-    if (data.episode) {
-      const ep = data.episode;
-      const dt = new Date(ep.date + 'T00:00:00');
-      const displayDate = dt.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
-      const sizeMB = (ep.file_size_bytes / (1024 * 1024)).toFixed(1);
-
-      html += `
-        <div class="episode-card">
-          <div class="episode-date">Latest Episode</div>
-          <div class="episode-title">The Hootline &mdash; ${escapeHtml(displayDate)}</div>
-          <div class="episode-meta">
-            <span>${ep.duration_formatted || ''}</span>
-            <span>${sizeMB} MB</span>
-            <span>${escapeHtml(ep.topics_summary || '')}</span>
-          </div>
-          <audio controls preload="metadata" src="${ep.audio_url}">
-            Your browser does not support the audio element.
-          </audio>
-          <div style="margin-top:12px;font-size:13px;">
-            <a href="/feed.xml" style="color:var(--accent);text-decoration:none;">RSS Feed</a>
-            <span style="color:var(--muted);margin:0 8px;">&middot;</span>
-            <span style="color:var(--muted);">Add this link to Spotify or your podcast app</span>
-          </div>
-        </div>`;
-    }
-
-    // Digest download card
-    if (data.digest) {
-      const d = data.digest;
-      html += `
-        <div class="digest-card">
-          <div class="digest-info">
-            <div class="digest-label">Today's Digest</div>
-            <div class="digest-stats">${d.article_count} articles &middot; ${d.total_words.toLocaleString()} words &middot; ${d.total_chars.toLocaleString()} chars</div>
-            <div class="digest-topics">${escapeHtml(d.topics_summary || '')}</div>
-          </div>
-          <a class="download-btn" href="${d.download_url}" download>Download .md</a>
-        </div>`;
-
-      // Upload form — shown when a digest exists
-      html += `
-        <div class="upload-card">
-          <div class="upload-label">Upload Episode MP3</div>
-          <div class="upload-row">
-            <input type="file" id="mp3-file" accept=".mp3,.m4a,.wav,.ogg,.webm,audio/*">
-            <button class="upload-btn" id="upload-btn" onclick="uploadEpisode('${escapeHtml(d.date)}')">Upload Episode</button>
-          </div>
-          <div class="upload-status" id="upload-status"></div>
-        </div>`;
-    }
-
-    page.innerHTML = html;
-  }
-
-  function escapeHtml(s) {
-    const d = document.createElement('div');
-    d.textContent = s;
-    return d.innerHTML;
-  }
-
-  async function triggerGenerate() {
-    const btn = document.getElementById('generate-btn');
-    btn.disabled = true;
-    btn.textContent = 'Preparing...';
-    try {
-      await fetch('/api/generate', { method: 'POST' });
-    } catch (e) {}
-    // Poll for completion
-    const poll = setInterval(async () => {
-      try {
-        const h = await (await fetch('/health')).json();
-        if (!h.generation_running) {
-          clearInterval(poll);
-          btn.disabled = false;
-          btn.textContent = 'Prepare Digest';
-          load();
-        }
-      } catch (e) {}
-    }, 5000);
-  }
-
-  async function uploadEpisode(date) {
-    const fileInput = document.getElementById('mp3-file');
-    const btn = document.getElementById('upload-btn');
-    const status = document.getElementById('upload-status');
-
-    if (!fileInput.files.length) {
-      status.className = 'upload-status error';
-      status.textContent = 'Please select an MP3 file first.';
-      return;
-    }
-
-    btn.disabled = true;
-    btn.textContent = 'Uploading...';
-    status.className = 'upload-status';
-    status.textContent = 'Uploading and processing...';
-
-    const form = new FormData();
-    form.append('file', fileInput.files[0]);
-    form.append('date', date);
-
-    try {
-      const res = await fetch('/api/upload-episode', { method: 'POST', body: form });
-      const data = await res.json();
-      if (res.ok) {
-        status.className = 'upload-status success';
-        const feedUrl = data.feed_url || '/feed.xml';
-        status.innerHTML = data.message + ' <a href="' + feedUrl + '" style="color:var(--accent);text-decoration:underline;">View RSS Feed</a>';
-        setTimeout(() => load(), 3000);
-      } else {
-        status.className = 'upload-status error';
-        status.textContent = data.error || 'Upload failed.';
+    if (data.suggestions && data.suggestions.length > 0) {
+      h += '<div class="sug-label">Recommendations</div>';
+      for (const s of data.suggestions) {
+        const pill = s.action==='subscribe' ? '+ Add' : '- Trim';
+        h += '<div class="sug-item ' + s.action + '"><span class="pill">' + pill + '</span>';
+        h += '<span><strong>' + esc(s.topic) + '</strong> &mdash; ' + esc(s.reason) + '</span></div>';
       }
-    } catch (e) {
-      status.className = 'upload-status error';
-      status.textContent = 'Network error. Please try again.';
+    } else if (data.has_data) {
+      h += '<div class="sug-label">Recommendations</div><div class="no-sug">Coverage is well balanced.</div>';
     }
 
-    btn.disabled = false;
-    btn.textContent = 'Upload Episode';
+    h += '</div>';
+    box.innerHTML = h;
+    drawRadar(topics, data.has_data);
+  } catch (e) {
+    console.error('Radar error', e);
+    box.innerHTML = '';
+  }
+}
+
+function drawRadar(topics, hasActual) {
+  const cv = document.getElementById('radar-cv');
+  if (!cv) return;
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  const cx = W/2, cy = H/2, R = Math.min(cx,cy)-52, n = topics.length, mx = 25;
+  ctx.clearRect(0,0,W,H);
+
+  const ang = i => (Math.PI*2*i/n) - Math.PI/2;
+  const pt = (i,p) => { const a=ang(i), r=(Math.min(p,mx)/mx)*R; return [cx+r*Math.cos(a), cy+r*Math.sin(a)]; };
+
+  // Grid
+  [5,10,15,20,25].forEach(r => {
+    ctx.beginPath();
+    for (let i=0;i<=n;i++) { const [x,y]=pt(i%n,r); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); }
+    ctx.closePath(); ctx.strokeStyle='#2e3140'; ctx.lineWidth=0.5; ctx.stroke();
+  });
+
+  // Spokes
+  for (let i=0;i<n;i++) {
+    const [x,y]=pt(i,mx);
+    ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(x,y); ctx.strokeStyle='#2e3140'; ctx.lineWidth=0.5; ctx.stroke();
   }
 
-  async function updateHealth() {
+  // Target (gold)
+  ctx.beginPath();
+  for (let i=0;i<=n;i++) { const [x,y]=pt(i%n,topics[i%n].target_pct); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); }
+  ctx.closePath(); ctx.fillStyle='rgba(196,160,82,0.12)'; ctx.fill();
+  ctx.strokeStyle='rgba(196,160,82,0.7)'; ctx.lineWidth=2; ctx.stroke();
+  for (let i=0;i<n;i++) { const [x,y]=pt(i,topics[i].target_pct); ctx.beginPath(); ctx.arc(x,y,2.5,0,Math.PI*2); ctx.fillStyle='rgba(196,160,82,0.8)'; ctx.fill(); }
+
+  // Actual (blue)
+  if (hasActual) {
+    ctx.beginPath();
+    for (let i=0;i<=n;i++) { const [x,y]=pt(i%n,topics[i%n].actual_pct); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); }
+    ctx.closePath(); ctx.fillStyle='rgba(96,165,250,0.12)'; ctx.fill();
+    ctx.strokeStyle='rgba(96,165,250,0.7)'; ctx.lineWidth=2; ctx.stroke();
+    for (let i=0;i<n;i++) { const [x,y]=pt(i,topics[i].actual_pct); ctx.beginPath(); ctx.arc(x,y,3,0,Math.PI*2); ctx.fillStyle='rgba(96,165,250,0.9)'; ctx.fill(); }
+  }
+
+  // Labels
+  ctx.font='9px monospace'; ctx.fillStyle='#c8c8cc';
+  for (let i=0;i<n;i++) {
+    const a=ang(i), lr=R+22, x=cx+lr*Math.cos(a), y=cy+lr*Math.sin(a);
+    ctx.textAlign = Math.abs(Math.cos(a))<0.15?'center':Math.cos(a)>0?'left':'right';
+    ctx.textBaseline = Math.abs(Math.sin(a))<0.15?'middle':Math.sin(a)>0?'top':'bottom';
+    let l=topics[i].name; if(l.length>16) l=l.slice(0,14)+'..';
+    ctx.fillText(l,x,y);
+  }
+}
+
+// ===== HISTORY TAB =====
+async function loadHistory() {
+  const box = document.getElementById('hist-content');
+  try {
+    const res = await fetch('/api/history');
+    const data = await res.json();
+    if (!data.rows || data.rows.length===0) { box.innerHTML='<div class="empty"><p>No digests yet.</p></div>'; return; }
+
+    let h = '<table class="htable"><thead><tr><th>Date</th><th>Digest</th><th>Audio</th><th>Digest Details</th><th>Audio Details</th></tr></thead><tbody>';
+    for (const r of data.rows) {
+      const dt = new Date(r.date+'T00:00:00');
+      const dd = dt.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'});
+
+      const digestC = r.has_digest
+        ? '<a class="h-link digest" href="/digests/'+r.date+'.md" download>Download</a>'
+        : '<span class="h-badge no">none</span>';
+
+      let audioC;
+      if (r.has_audio) {
+        const url = r.gcs_url || ('/episodes/noctua-'+r.date+'.mp3');
+        audioC = '<a class="h-link audio" href="'+url+'" target="_blank">Play</a>';
+      } else {
+        audioC = '<span class="h-badge no">none</span>';
+      }
+
+      const dDetail = r.has_digest
+        ? '<span class="h-detail">'+r.article_count+' articles &middot; '+r.total_words.toLocaleString()+' words &middot; '+r.total_chars.toLocaleString()+' chars</span>'
+        : '<span class="h-detail">&mdash;</span>';
+
+      let aDetail = '&mdash;';
+      if (r.has_audio) {
+        const mb = (r.file_size_bytes/1048576).toFixed(1);
+        aDetail = r.duration_formatted+' &middot; '+mb+' MB';
+        if (r.rss_summary) aDetail += '<br><span style="color:var(--text);">'+esc(r.rss_summary)+'</span>';
+      }
+
+      let topics = '';
+      if (r.topics_summary) topics = '<br><span style="color:var(--text-dim);font-size:10px;">'+esc(r.topics_summary)+'</span>';
+
+      h += '<tr><td class="h-date">'+esc(dd)+'</td><td>'+digestC+'</td><td>'+audioC+'</td>';
+      h += '<td>'+dDetail+topics+'</td><td class="h-detail">'+aDetail+'</td></tr>';
+    }
+    h += '</tbody></table>';
+    box.innerHTML = h;
+  } catch (e) {
+    console.error('History error', e);
+    box.innerHTML = '<div class="empty"><p>Failed to load history.</p></div>';
+  }
+}
+
+// ===== ACTIONS =====
+async function triggerGen() {
+  const btn = document.getElementById('gen-btn');
+  btn.disabled = true; btn.textContent = 'Preparing...';
+  try { await fetch('/api/generate',{method:'POST'}); } catch(e) {}
+  const poll = setInterval(async () => {
     try {
       const h = await (await fetch('/health')).json();
-      const btn = document.getElementById('generate-btn');
-      const info = document.getElementById('scheduler-info');
-      if (h.generation_running) {
-        btn.disabled = true;
-        btn.textContent = 'Preparing...';
-      } else {
-        btn.disabled = false;
-        btn.textContent = 'Prepare Digest';
-      }
-      if (h.next_scheduled_run) {
-        const next = new Date(h.next_scheduled_run);
-        info.textContent = 'Next: ' + next.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-      }
-    } catch (e) {}
-  }
+      if (!h.generation_running) { clearInterval(poll); btn.disabled=false; btn.textContent='Prepare Digest'; loadLatest(); }
+    } catch(e) {}
+  }, 5000);
+}
 
-  load();
-  updateHealth();
-  setInterval(updateHealth, 10000);
+async function uploadEp(date) {
+  const fi = document.getElementById('mp3-file');
+  const btn = document.getElementById('up-btn');
+  const st = document.getElementById('up-status');
+  if (!fi.files.length) { st.className='upload-status error'; st.textContent='Select a file first.'; return; }
+  btn.disabled=true; btn.textContent='Uploading...';
+  st.className='upload-status'; st.textContent='Uploading and processing...';
+  const form = new FormData(); form.append('file',fi.files[0]); form.append('date',date);
+  try {
+    const res = await fetch('/api/upload-episode',{method:'POST',body:form});
+    const data = await res.json();
+    if (res.ok) {
+      st.className='upload-status success';
+      st.innerHTML = data.message + ' <a href="/feed.xml" style="color:var(--accent);">View Feed</a>';
+      setTimeout(() => loadLatest(), 2000);
+    } else { st.className='upload-status error'; st.textContent=data.error||'Upload failed.'; }
+  } catch(e) { st.className='upload-status error'; st.textContent='Network error.'; }
+  btn.disabled=false; btn.textContent='Upload';
+}
+
+async function updateHealth() {
+  try {
+    const h = await (await fetch('/health')).json();
+    const btn = document.getElementById('gen-btn');
+    const info = document.getElementById('sched-info');
+    if (h.generation_running) { btn.disabled=true; btn.textContent='Preparing...'; }
+    else { btn.disabled=false; btn.textContent='Prepare Digest'; }
+    if (h.next_scheduled_run) {
+      const next = new Date(h.next_scheduled_run);
+      info.textContent = 'Next: ' + next.toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+    }
+  } catch(e) {}
+}
+
+loadLatest();
+updateHealth();
+setInterval(updateHealth, 10000);
 </script>
-
 </body>
 </html>
 """

@@ -1,9 +1,13 @@
 """Compile parsed articles into a single source document for NotebookLM."""
 
+import json
 import logging
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 
+import requests
+
+from config import settings
 from src.exceptions import DigestCompileError
 from src.models import Article, CompiledDigest, DailyDigest
 from src.topic_classifier import SEGMENT_DURATIONS, SEGMENT_ORDER, Topic
@@ -54,6 +58,55 @@ def _build_topics_summary(digest: DailyDigest, segment_counts: dict[str, int]) -
         if count > 0:
             parts.append(f"{topic.value} ({count})")
     return "; ".join(parts) if parts else "No segments"
+
+
+def _generate_rss_summary(articles: list[Article]) -> str:
+    """Generate a short (~15 word) episode description using the Claude API.
+
+    Falls back to a generic description if the API call fails or no key is set.
+    """
+    if not settings.anthropic_api_key:
+        logger.warning("No Anthropic API key — using fallback RSS summary")
+        return "Your nightly knowledge briefing from The Hootline."
+
+    titles = [a.title for a in articles[:30]]
+    titles_text = "\n".join(f"- {t}" for t in titles)
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": settings.anthropic_api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 60,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Below are today's podcast episode article titles.\n\n"
+                            f"{titles_text}\n\n"
+                            "Write a single sentence (~15 words) summarizing what "
+                            "this episode covers. No quotes, no preamble — just the sentence."
+                        ),
+                    }
+                ],
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        summary = data["content"][0]["text"].strip().rstrip(".")
+        # Ensure it's not excessively long
+        if len(summary.split()) > 25:
+            summary = " ".join(summary.split()[:20])
+        return summary
+    except Exception as e:
+        logger.warning("RSS summary generation failed: %s — using fallback", e)
+        return "Your nightly knowledge briefing from The Hootline."
 
 
 def _allocate_budget(articles: list[Article], budget: int) -> dict[int, int]:
@@ -209,6 +262,7 @@ def compile(digest: DailyDigest) -> CompiledDigest:
     try:
         text, segment_counts = _compile_text(digest, date_display)
         topics_summary = _build_topics_summary(digest, segment_counts)
+        rss_summary = _generate_rss_summary(digest.articles)
         total_words = len(text.split())
 
         compiled = CompiledDigest(
@@ -217,6 +271,7 @@ def compile(digest: DailyDigest) -> CompiledDigest:
             total_words=total_words,
             date=date_ymd,
             topics_summary=topics_summary,
+            rss_summary=rss_summary,
             segment_counts=segment_counts,
         )
 

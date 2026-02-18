@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     # Secret for external cron trigger (e.g. cron-job.org)
     cron_secret: str = ""
 
+    # Google Cloud Storage (for permanent episode MP3 hosting)
+    gcs_bucket_name: str = ""
+    gcs_credentials_json: str = ""
+
     # Serving
     base_url: str = "http://localhost:8000"
     podcast_title: str = "The Hootline"

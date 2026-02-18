@@ -45,6 +45,7 @@ class CompiledDigest:
     total_words: int
     date: str  # YYYY-MM-DD
     topics_summary: str
+    rss_summary: str = ""
     segment_counts: dict[str, int] = field(default_factory=dict)
 
 
@@ -58,3 +59,5 @@ class EpisodeMetadata:
     duration_seconds: int
     duration_formatted: str  # HH:MM:SS
     topics_summary: str
+    rss_summary: str = ""
+    gcs_url: str = ""
