@@ -47,6 +47,7 @@ class CompiledDigest:
     topics_summary: str
     rss_summary: str = ""
     segment_counts: dict[str, int] = field(default_factory=dict)
+    segment_sources: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass

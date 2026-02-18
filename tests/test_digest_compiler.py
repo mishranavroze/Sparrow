@@ -72,7 +72,7 @@ def test_compile_empty_raises():
 
 def test_compile_text_includes_segment_structure():
     digest = _make_digest()
-    text, segment_counts = _compile_text(digest, "February 17, 2026")
+    text, segment_counts, _ = _compile_text(digest, "February 17, 2026")
     assert "# The Hootline" in text
     assert "SEGMENT" in text
     assert "---" in text
@@ -80,7 +80,7 @@ def test_compile_text_includes_segment_structure():
 
 def test_compile_text_includes_preamble():
     digest = _make_digest()
-    text, _ = _compile_text(digest, "February 17, 2026")
+    text, _, _ = _compile_text(digest, "February 17, 2026")
     assert "PODCAST PRODUCTION INSTRUCTIONS" in text
 
 
@@ -92,7 +92,7 @@ def test_compile_text_segments_in_order():
         _make_article(source="1440", title="World Politics Article", topic=Topic.WORLD_POLITICS.value),
     ]
     digest = _make_digest(articles)
-    text, _ = _compile_text(digest, "February 17, 2026")
+    text, _, _ = _compile_text(digest, "February 17, 2026")
 
     tech_pos = text.index("Tech Article")
     world_pos = text.index("World Politics Article")
@@ -107,7 +107,7 @@ def test_compile_text_skips_empty_segments():
         _make_article(source="NYT", title="Only Tech", topic=Topic.TECH_AI.value),
     ]
     digest = _make_digest(articles)
-    text, segment_counts = _compile_text(digest, "February 17, 2026")
+    text, segment_counts, _ = _compile_text(digest, "February 17, 2026")
 
     assert "Latest in Tech" in text
     assert "World Politics" not in text
@@ -123,7 +123,7 @@ def test_compile_text_segment_counts():
         _make_article(source="Neuron", title="Article 3", topic=Topic.TECH_AI.value),
     ]
     digest = _make_digest(articles)
-    _, segment_counts = _compile_text(digest, "February 17, 2026")
+    _, segment_counts, _ = _compile_text(digest, "February 17, 2026")
 
     assert segment_counts[Topic.US_POLITICS.value] == 2
     assert segment_counts[Topic.TECH_AI.value] == 1
@@ -135,7 +135,7 @@ def test_compile_text_shows_source():
         _make_article(source="The New York Times", title="Test", topic=Topic.OTHER.value),
     ]
     digest = _make_digest(articles)
-    text, _ = _compile_text(digest, "February 17, 2026")
+    text, _, _ = _compile_text(digest, "February 17, 2026")
 
     assert "*Source: The New York Times*" in text
 
@@ -151,7 +151,7 @@ def test_compile_text_truncates_long_content():
         )
     ]
     digest = DailyDigest(articles=articles, total_words=100_000)
-    text, _ = _compile_text(digest, "Feb 17, 2026")
+    text, _, _ = _compile_text(digest, "Feb 17, 2026")
     assert len(text) <= MAX_SOURCE_CHARS + 500  # margin for headers + preamble
 
 
@@ -198,7 +198,7 @@ def test_compile_text_duration_labels():
         _make_article(source="Neuron", title="Tech News", topic=Topic.TECH_AI.value),
     ]
     digest = _make_digest(articles)
-    text, _ = _compile_text(digest, "February 17, 2026")
+    text, _, _ = _compile_text(digest, "February 17, 2026")
 
     assert "~5 minutes" in text  # Tech
     assert "~4 minutes" in text  # World Politics

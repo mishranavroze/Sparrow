@@ -73,6 +73,11 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE digests ADD COLUMN segment_counts TEXT NOT NULL DEFAULT '{}'")
     except sqlite3.OperationalError:
         pass  # Column already exists
+    # Migrate: add segment_sources column to digests if missing
+    try:
+        conn.execute("ALTER TABLE digests ADD COLUMN segment_sources TEXT NOT NULL DEFAULT '{}'")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     # Migrate: add gcs_url column to episodes if missing
     try:
         conn.execute("ALTER TABLE episodes ADD COLUMN gcs_url TEXT NOT NULL DEFAULT ''")
@@ -85,14 +90,15 @@ def _create_tables(conn: sqlite3.Connection) -> None:
 
 def save_digest(date: str, markdown_text: str, article_count: int,
                 total_words: int, topics_summary: str, rss_summary: str = "",
-                segment_counts: dict[str, int] | None = None) -> None:
+                segment_counts: dict[str, int] | None = None,
+                segment_sources: dict[str, list[str]] | None = None) -> None:
     """Save or update a daily digest."""
     conn = _get_connection()
     try:
         conn.execute(
             """INSERT INTO digests (date, markdown_text, article_count, total_words,
-               topics_summary, rss_summary, segment_counts, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               topics_summary, rss_summary, segment_counts, segment_sources, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(date) DO UPDATE SET
                markdown_text=excluded.markdown_text,
                article_count=excluded.article_count,
@@ -100,9 +106,11 @@ def save_digest(date: str, markdown_text: str, article_count: int,
                topics_summary=excluded.topics_summary,
                rss_summary=excluded.rss_summary,
                segment_counts=excluded.segment_counts,
+               segment_sources=excluded.segment_sources,
                created_at=excluded.created_at""",
             (date, markdown_text, article_count, total_words, topics_summary,
              rss_summary, json.dumps(segment_counts or {}),
+             json.dumps(segment_sources or {}),
              datetime.now(UTC).isoformat()),
         )
         conn.commit()
@@ -138,17 +146,18 @@ def list_digests(limit: int = 50) -> list[dict]:
 
 
 def get_topic_coverage(limit: int = 30) -> list[dict]:
-    """Get segment_counts from recent digests for topic coverage analysis."""
+    """Get segment_counts and segment_sources from recent digests for topic coverage analysis."""
     conn = _get_connection()
     try:
         rows = conn.execute(
-            "SELECT date, segment_counts FROM digests ORDER BY date DESC LIMIT ?",
+            "SELECT date, segment_counts, segment_sources FROM digests ORDER BY date DESC LIMIT ?",
             (limit,),
         ).fetchall()
         result = []
         for r in rows:
             d = dict(r)
             d["segment_counts"] = json.loads(d["segment_counts"])
+            d["segment_sources"] = json.loads(d.get("segment_sources") or "{}")
             result.append(d)
         return result
     finally:

@@ -218,9 +218,14 @@ async def api_topic_coverage(mode: str = Query("cumulative")):
     limit = 1 if mode == "latest" else 30
     digests = database.get_topic_coverage(limit=limit)
     totals: dict[str, int] = {}
+    all_sources: dict[str, set[str]] = {}
     for d in digests:
         for topic_name, count in d["segment_counts"].items():
             totals[topic_name] = totals.get(topic_name, 0) + count
+        for topic_name, sources in d.get("segment_sources", {}).items():
+            if topic_name not in all_sources:
+                all_sources[topic_name] = set()
+            all_sources[topic_name].update(sources)
     grand_total = sum(totals.values())
     has_data = grand_total > 0
 
@@ -253,7 +258,8 @@ async def api_topic_coverage(mode: str = Query("cumulative")):
     # Suggestions (only when we have actual data)
     suggestions = []
     if has_data:
-        for t in topics:
+        for topic_enum, t in zip(SEGMENT_ORDER, topics):
+            topic_sources = sorted(all_sources.get(topic_enum.value, []))
             if t["actual_pct"] < 30:
                 suggestions.append({
                     "topic": t["name"],
@@ -261,10 +267,11 @@ async def api_topic_coverage(mode: str = Query("cumulative")):
                     "reason": f"Only {t['actual_pct']:.0f}% covered — consider adding sources",
                 })
             elif t["actual_pct"] > 200:
+                src_list = ", ".join(topic_sources) if topic_sources else "unknown"
                 suggestions.append({
                     "topic": t["name"],
                     "action": "unsubscribe",
-                    "reason": f"{t['actual_pct']:.0f}% covered — consider reducing sources",
+                    "reason": f"{t['actual_pct']:.0f}% covered — current sources: {src_list}",
                 })
 
     return JSONResponse({

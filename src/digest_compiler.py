@@ -161,7 +161,7 @@ def _compile_text(
         date_str: Formatted date string for the header.
 
     Returns:
-        Tuple of (compiled document text, segment article counts).
+        Tuple of (compiled document text, segment article counts, segment sources).
     """
     # Group articles by topic
     grouped: dict[str, list[Article]] = defaultdict(list)
@@ -224,6 +224,7 @@ def _compile_text(
     sections.append(intro)
 
     segment_counts: dict[str, int] = {}
+    segment_sources: dict[str, list[str]] = {}
     segment_number = 0
     article_index = 0
 
@@ -234,6 +235,9 @@ def _compile_text(
 
         segment_number += 1
         segment_counts[topic.value] = len(articles)
+        # Track unique sources for this segment
+        sources = list(dict.fromkeys(a.source for a in articles))
+        segment_sources[topic.value] = sources
 
         duration = SEGMENT_DURATIONS.get(topic, "")
         duration_label = f" ({duration})" if duration else ""
@@ -256,7 +260,7 @@ def _compile_text(
     sections.append(outro)
     text = "\n\n".join(sections)
 
-    return text, segment_counts
+    return text, segment_counts, segment_sources
 
 
 def compile(digest: DailyDigest) -> CompiledDigest:
@@ -278,7 +282,7 @@ def compile(digest: DailyDigest) -> CompiledDigest:
     date_display = episode_date.strftime("%B %-d, %Y")
 
     try:
-        text, segment_counts = _compile_text(digest, date_display)
+        text, segment_counts, segment_sources = _compile_text(digest, date_display)
         topics_summary = _build_topics_summary(digest, segment_counts)
         rss_summary = _generate_rss_summary(digest.articles)
         total_words = len(text.split())
@@ -291,6 +295,7 @@ def compile(digest: DailyDigest) -> CompiledDigest:
             topics_summary=topics_summary,
             rss_summary=rss_summary,
             segment_counts=segment_counts,
+            segment_sources=segment_sources,
         )
 
         logger.info(
