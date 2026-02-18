@@ -401,8 +401,18 @@ async def api_topic_coverage(mode: str = Query("cumulative")):
     total_minutes = sum(duration_map.values())
 
     # Actual coverage from recent digests
-    limit = 1 if mode == "latest" else 30
-    digests = database.get_topic_coverage(limit=limit)
+    # When preparation is active and mode=latest, use the in-memory digest
+    # so the radar reflects the new digest, not the old published one.
+    if mode == "latest" and _preparation_active and _preparation_digest:
+        digests = [{
+            "date": _preparation_digest.date,
+            "segment_counts": _preparation_digest.segment_counts or {},
+            "segment_sources": _preparation_digest.segment_sources or {},
+        }]
+    else:
+        limit = 1 if mode == "latest" else 30
+        digests = database.get_topic_coverage(limit=limit)
+
     totals: dict[str, int] = {}
     all_sources: dict[str, set[str]] = {}
     for d in digests:
