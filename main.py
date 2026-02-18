@@ -1,10 +1,12 @@
 """FastAPI app — serves RSS feed, audio files, and dashboard."""
 
 import asyncio
+import io
 import json
 import logging
 import re
 import subprocess
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -314,6 +316,33 @@ async def api_history():
         })
 
     return JSONResponse({"rows": rows, "total": len(rows)})
+
+
+@app.get("/api/export-episodes")
+async def api_export_episodes():
+    """Bundle all local episode MP3s into a ZIP for download."""
+    if not EPISODES_DIR.exists():
+        return JSONResponse({"error": "No episodes directory found."}, status_code=404)
+
+    cutoff = (datetime.now(UTC) - timedelta(days=7)).strftime("%Y-%m-%d")
+    mp3_files = sorted(
+        mp3 for mp3 in EPISODES_DIR.glob("noctua-*.mp3")
+        if mp3.stem.removeprefix("noctua-") >= cutoff
+    )
+    if not mp3_files:
+        return JSONResponse({"error": "No episodes from the last 7 days."}, status_code=404)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        for mp3 in mp3_files:
+            zf.write(mp3, mp3.name)
+    buf.seek(0)
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="hootline-episodes.zip"'},
+    )
 
 
 @app.get("/digests/{date}.md")
@@ -630,7 +659,7 @@ DASHBOARD_HTML = """\
   /* Latest: two-column */
   .latest-layout { display: flex; gap: 24px; max-width: 1200px; margin: 0 auto; padding: 24px; align-items: flex-start; }
   .latest-left { flex: 1; min-width: 0; }
-  .latest-right { width: 420px; flex-shrink: 0; }
+  .latest-right { width: 540px; flex-shrink: 0; }
 
   /* Card */
   .card {
@@ -835,7 +864,7 @@ async function loadRadar(mode) {
     h += '<button class="' + (radarMode==='cumulative'?'active':'') + '" onclick="loadRadar(\\'cumulative\\')">All Time</button>';
     h += '<button class="' + (radarMode==='latest'?'active':'') + '" onclick="loadRadar(\\'latest\\')">Latest</button>';
     h += '</div></div>';
-    h += '<canvas id="radar-cv" width="380" height="380" style="display:block;margin:0 auto;"></canvas>';
+    h += '<canvas id="radar-cv" width="500" height="500" style="display:block;margin:0 auto;"></canvas>';
     h += '<div class="radar-legend"><span><span class="sw" style="background:rgba(196,160,82,0.6);"></span>Target (100%)</span>';
     h += '<span><span class="sw" style="background:rgba(96,165,250,0.6);"></span>Actual</span></div>';
     const lbl = radarMode==='latest' ? 'latest digest' : data.digests_analyzed + ' digests';
@@ -876,7 +905,7 @@ function drawRadar(topics, hasActual) {
   if (!cv) return;
   const ctx = cv.getContext('2d');
   const W = cv.width, H = cv.height;
-  const cx = W/2, cy = H/2, R = Math.min(cx,cy)-58, n = topics.length, mx = 150;
+  const cx = W/2, cy = H/2, R = Math.min(cx,cy)-75, n = topics.length, mx = 150;
   ctx.clearRect(0,0,W,H);
 
   const ang = i => (Math.PI*2*i/n) - Math.PI/2;
@@ -916,13 +945,12 @@ function drawRadar(topics, hasActual) {
   }
 
   // Labels (topic name with allocated minutes)
-  ctx.font='8px monospace'; ctx.fillStyle='#c8c8cc';
+  ctx.font='10px monospace'; ctx.fillStyle='#c8c8cc';
   for (let i=0;i<n;i++) {
-    const a=ang(i), lr=R+24, x=cx+lr*Math.cos(a), y=cy+lr*Math.sin(a);
+    const a=ang(i), lr=R+30, x=cx+lr*Math.cos(a), y=cy+lr*Math.sin(a);
     ctx.textAlign = Math.abs(Math.cos(a))<0.15?'center':Math.cos(a)>0?'left':'right';
     ctx.textBaseline = Math.abs(Math.sin(a))<0.15?'middle':Math.sin(a)>0?'top':'bottom';
-    let l=topics[i].name; if(l.length>22) l=l.slice(0,20)+'..';
-    ctx.fillText(l,x,y);
+    ctx.fillText(topics[i].name,x,y);
   }
 }
 
@@ -934,7 +962,19 @@ async function loadHistory() {
     const data = await res.json();
     if (!data.rows || data.rows.length===0) { box.innerHTML='<div class="empty"><p>No digests yet.</p></div>'; return; }
 
-    let h = '<table class="htable"><thead><tr><th>Date</th><th>Digest</th><th>Audio</th><th>Digest Details</th><th>Audio Details</th></tr></thead><tbody>';
+    // Export button — last 7 days only
+    const cutoff = new Date(Date.now() - 7*86400000).toISOString().slice(0,10);
+    const recent = data.rows.filter(r => r.has_audio && r.date >= cutoff);
+    const recentBytes = recent.reduce((s, r) => s + (r.file_size_bytes || 0), 0);
+    const recentMB = (recentBytes / 1048576).toFixed(1);
+    let h = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">';
+    h += '<span style="font-size:12px;color:var(--text-dim);">' + recent.length + ' episodes last 7 days &middot; ' + recentMB + ' MB</span>';
+    if (recent.length > 0) {
+      h += '<button class="btn" onclick="window.location=\\'/api/export-episodes\\'">Export Last 7 Days (ZIP)</button>';
+    }
+    h += '</div>';
+
+    h += '<table class="htable"><thead><tr><th>Date</th><th>Digest</th><th>Audio</th><th>Digest Details</th><th>Audio Details</th></tr></thead><tbody>';
     for (const r of data.rows) {
       const dt = new Date(r.date+'T00:00:00');
       const dd = dt.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'});

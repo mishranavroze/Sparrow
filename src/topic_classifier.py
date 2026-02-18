@@ -23,7 +23,9 @@ class Topic(StrEnum):
     ARSENAL = "Arsenal"
     INDIAN_CRICKET = "Indian Cricket"
     BADMINTON = "Badminton"
-    OTHER = "Other Newsletter Insights"
+    SPORTS = "Sports"
+    SEATTLE = "Seattle"
+    OTHER = "Misc"
 
 
 # Ordered list for segment rendering (priority order)
@@ -39,6 +41,8 @@ SEGMENT_ORDER: list[Topic] = [
     Topic.ARSENAL,
     Topic.INDIAN_CRICKET,
     Topic.BADMINTON,
+    Topic.SPORTS,
+    Topic.SEATTLE,
     Topic.OTHER,
 ]
 
@@ -55,6 +59,8 @@ SEGMENT_DURATIONS: dict[Topic, str] = {
     Topic.ARSENAL: "~1 minute",
     Topic.INDIAN_CRICKET: "~1 minute",
     Topic.BADMINTON: "~1 minute",
+    Topic.SPORTS: "~1 minute",
+    Topic.SEATTLE: "~1 minute",
     Topic.OTHER: "~1 minute",
 }
 
@@ -100,6 +106,17 @@ SOURCE_TOPIC_MAP: dict[str, Topic] = {
     "peter steinberger": Topic.TECH_AI,
     "interesting facts": Topic.OTHER,
     "better report": Topic.OTHER,
+}
+
+# Multi-topic aggregators: only need 1 keyword match (instead of 2)
+AGGREGATOR_SOURCES: set[str] = {
+    "the new york times",
+    "nyt",
+    "new york times",
+    "1440",
+    "apple news",
+    "apple news sports",
+    "good morning from apple news",
 }
 
 # Keyword lists for multi-topic sources (NYT, 1440, Apple News, etc.)
@@ -195,6 +212,27 @@ TOPIC_KEYWORDS: dict[Topic, list[str]] = {
         r"\bSatwiksairaj\b", r"\bChirag\b", r"\bShetty\b",
         r"\bSuper 750\b", r"\bSuper 1000\b", r"\bsmash\b.*\bbadminton",
     ],
+    Topic.SPORTS: [
+        r"\bNFL\b", r"\bNBA\b", r"\bMLB\b", r"\bNHL\b", r"\bMLS\b",
+        r"\bSuper Bowl\b", r"\bplayoff", r"\bchampionship\b",
+        r"\btournament\b", r"\bathlet", r"\bcoach\b",
+        r"\bscor(?:e|ed|ing)\b", r"\bwin\b.*\bgame",
+        r"\bgame\b.*\bwin", r"\bsport",
+        r"\btennis\b", r"\bgolf\b", r"\bboxing\b", r"\bMMA\b",
+        r"\bUFC\b", r"\bOlympic", r"\bmarathon\b", r"\bswimming\b",
+        r"\bbasketball\b", r"\bfootball\b", r"\bsoccer\b",
+        r"\bbaseball\b", r"\bhockey\b", r"\brugby\b",
+    ],
+    Topic.SEATTLE: [
+        r"\bSeattle\b", r"\bSounders\b", r"\bKraken\b",
+        r"\bMariners\b", r"\bSeahawks\b", r"\bPuget Sound\b",
+        r"\bKing County\b", r"\bPike Place\b", r"\bCapitol Hill\b",
+        r"\bBellevue\b", r"\bRedmond\b", r"\bTacoma\b",
+        r"\bWashington State\b", r"\bSpace Needle\b",
+        r"\bAmazon\b.*\bSeattle", r"\bSeattle\b.*\bAmazon",
+        r"\bMicrosoft\b.*\bRedmond", r"\bPacific Northwest\b",
+        r"\bPNW\b", r"\bI-5\b", r"\bSea-Tac\b",
+    ],
 }
 
 
@@ -253,8 +291,11 @@ def classify_article(article: Article) -> Topic | None:
             best_score = score
             best_topic = topic
 
-    # Require at least 2 keyword matches to assign a specific topic
-    if best_score < 2:
+    # Known aggregators (multi-topic sources) need only 1 keyword match;
+    # unknown sources need 2 to avoid false positives.
+    is_aggregator = any(a in source_lower for a in AGGREGATOR_SOURCES)
+    min_score = 1 if is_aggregator else 2
+    if best_score < min_score:
         best_topic = Topic.OTHER
 
     logger.debug(
