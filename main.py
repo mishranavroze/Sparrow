@@ -1371,10 +1371,13 @@ async function loadRadar(mode, containerId) {
     if (!topics) { box.innerHTML = ''; return; }
 
     let h = '<div class="radar-card"><div class="radar-hdr"><div class="card-label">Topic Coverage</div>';
-    h += '<div class="radar-toggle">';
-    h += '<button class="' + (mode==='latest'?'active':'') + '" onclick="loadRadar(\\'latest\\',\\'' + containerId + '\\')">Latest</button>';
-    h += '<button class="' + (mode==='cumulative'?'active':'') + '" onclick="loadRadar(\\'cumulative\\',\\'' + containerId + '\\')">All Time</button>';
-    h += '</div></div>';
+    if (containerId !== 'hist-radar') {
+      h += '<div class="radar-toggle">';
+      h += '<button class="' + (mode==='latest'?'active':'') + '" onclick="loadRadar(\\'latest\\',\\'' + containerId + '\\')">Latest</button>';
+      h += '<button class="' + (mode==='cumulative'?'active':'') + '" onclick="loadRadar(\\'cumulative\\',\\'' + containerId + '\\')">All Time</button>';
+      h += '</div>';
+    }
+    h += '</div>';
     h += '<canvas id="' + canvasId + '" width="500" height="500" style="display:block;margin:0 auto;"></canvas>';
     h += '<div class="radar-legend"><span><span class="sw" style="background:rgba(196,160,82,0.6);"></span>Target (100%)</span>';
     h += '<span><span class="sw" style="background:rgba(96,165,250,0.6);"></span>Actual</span></div>';
