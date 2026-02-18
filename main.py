@@ -835,11 +835,21 @@ async function loadRadar(mode) {
     h += '<div class="radar-stats">' + lbl + ' &middot; ' + data.total_articles + ' articles' + (!data.has_data?' &middot; no coverage data yet':'') + '</div>';
 
     if (data.suggestions && data.suggestions.length > 0) {
-      h += '<div class="sug-label">Recommendations</div>';
-      for (const s of data.suggestions) {
-        const pill = s.action==='subscribe' ? '+ Add' : '- Trim';
-        h += '<div class="sug-item ' + s.action + '"><span class="pill">' + pill + '</span>';
-        h += '<span><strong>' + esc(s.topic) + '</strong> &mdash; ' + esc(s.reason) + '</span></div>';
+      const adds = data.suggestions.filter(s => s.action==='subscribe');
+      const trims = data.suggestions.filter(s => s.action==='unsubscribe');
+      if (adds.length) {
+        h += '<div class="sug-label">Add Sources</div>';
+        for (const s of adds) {
+          h += '<div class="sug-item subscribe"><span class="pill">+ Add</span>';
+          h += '<span><strong>' + esc(s.topic) + '</strong> &mdash; ' + esc(s.reason) + '</span></div>';
+        }
+      }
+      if (trims.length) {
+        h += '<div class="sug-label">Trim Sources</div>';
+        for (const s of trims) {
+          h += '<div class="sug-item unsubscribe"><span class="pill">- Trim</span>';
+          h += '<span><strong>' + esc(s.topic) + '</strong> &mdash; ' + esc(s.reason) + '</span></div>';
+        }
       }
     } else if (data.has_data) {
       h += '<div class="sug-label">Recommendations</div><div class="no-sug">Coverage is well balanced.</div>';

@@ -169,6 +169,24 @@ def _compile_text(
         topic_key = article.topic if article.topic else Topic.OTHER.value
         grouped[topic_key].append(article)
 
+    # Cap articles per topic proportional to allocated minutes.
+    # ~1.5 articles per minute, minimum 2 per topic.
+    total_before = sum(len(v) for v in grouped.values())
+    for topic in SEGMENT_ORDER:
+        dur_str = SEGMENT_DURATIONS.get(topic, "~1 minute")
+        mins = int(dur_str.replace("~", "").replace(" minutes", "").replace(" minute", ""))
+        max_articles = max(2, round(mins * 1.5))
+        articles_list = grouped.get(topic.value, [])
+        if len(articles_list) > max_articles:
+            logger.info(
+                "Capping %s from %d to %d articles (allocated %dm)",
+                topic.value, len(articles_list), max_articles, mins,
+            )
+            grouped[topic.value] = articles_list[:max_articles]
+    total_after = sum(len(v) for v in grouped.values())
+    if total_after < total_before:
+        logger.info("Topic capping: %d -> %d articles", total_before, total_after)
+
     # Collect articles in segment order and estimate per-article overhead
     # (title line, source line, separator, joining newlines)
     ordered_articles: list[Article] = []
