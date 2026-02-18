@@ -145,6 +145,29 @@ def list_digests(limit: int = 50) -> list[dict]:
         conn.close()
 
 
+def delete_digests_between(start: str, end: str) -> int:
+    """Delete digests in a date range (inclusive).
+
+    Args:
+        start: Start date (YYYY-MM-DD).
+        end: End date (YYYY-MM-DD).
+
+    Returns:
+        Number of rows deleted.
+    """
+    conn = _get_connection()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM digests WHERE date BETWEEN ? AND ?", (start, end)
+        )
+        conn.commit()
+        deleted = cursor.rowcount
+        logger.info("Deleted %d digests between %s and %s", deleted, start, end)
+        return deleted
+    finally:
+        conn.close()
+
+
 def get_topic_coverage(limit: int = 30) -> list[dict]:
     """Get segment_counts and segment_sources from recent digests for topic coverage analysis."""
     conn = _get_connection()

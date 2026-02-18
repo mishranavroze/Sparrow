@@ -153,6 +153,13 @@ def add_episode(metadata: EpisodeMetadata) -> None:
         raise FeedBuildError(f"Failed to add episode to feed: {e}") from e
 
 
+def clear_feed() -> None:
+    """Remove all episodes from the feed catalog and rebuild an empty feed."""
+    _save_episode_catalog([])
+    build_feed()
+    logger.info("Feed cleared — episodes.json emptied and feed.xml rebuilt.")
+
+
 def build_feed() -> str:
     """Build or rebuild the complete RSS feed XML.
 

@@ -60,7 +60,7 @@ def _ensure_mp3(path: Path) -> Path:
     return path
 
 
-MAX_EPISODES = 30
+MAX_EPISODES = 7
 
 
 def _format_duration(seconds: int) -> str:

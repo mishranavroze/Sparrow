@@ -8,7 +8,7 @@ import re
 import subprocess
 import zipfile
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Form, Query, Request, Response, UploadFile
@@ -26,6 +26,44 @@ logger = logging.getLogger(__name__)
 EPISODES_DIR = Path("output/episodes")
 EPISODES_JSON = Path("output/episodes.json")
 FEED_PATH = Path("output/feed.xml")
+EXPORTS_DIR = Path("output/exports")
+
+PST = timezone(timedelta(hours=-8))
+
+
+def _pst_now() -> datetime:
+    """Return the current datetime in PST (UTC-8)."""
+    return datetime.now(PST)
+
+
+def _iso_week_label(dt: datetime) -> str:
+    """Return a week label like 'W08-2026' from a date."""
+    iso_year, iso_week, _ = dt.isocalendar()
+    return f"W{iso_week:02d}-{iso_year}"
+
+
+def _week_date_range(dt: datetime) -> tuple[str, str]:
+    """Return (monday_str, sunday_str) for the ISO week containing dt."""
+    iso_year, iso_week, iso_day = dt.isocalendar()
+    monday = dt.date() - timedelta(days=iso_day - 1)
+    sunday = monday + timedelta(days=6)
+    return monday.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d")
+
+
+def _add_digests_to_zip(zf: zipfile.ZipFile, mon: str, sun: str) -> int:
+    """Add digest .md files for dates in [mon, sun] to an open ZipFile.
+
+    Returns the number of digests added.
+    """
+    count = 0
+    digests = database.list_digests(limit=100)
+    for d in digests:
+        if mon <= d["date"] <= sun:
+            full = database.get_digest(d["date"])
+            if full and full["markdown_text"]:
+                zf.writestr(f"noctua-digest-{d['date']}.md", full["markdown_text"])
+                count += 1
+    return count
 
 # --- Generation state ---
 _generation_lock = asyncio.Lock()
@@ -67,11 +105,71 @@ async def _run_generation() -> None:
     async with _generation_lock:
         _generation_running = True
         try:
+            await _maybe_monday_cleanup()
             await generate_digest_only()
         except Exception as e:
             logger.error("Digest preparation failed: %s", e)
         finally:
             _generation_running = False
+
+
+def _last_week_mp3s_exist() -> bool:
+    """Check if MP3s from last week are still on disk."""
+    if not EPISODES_DIR.exists():
+        return False
+    now = _pst_now()
+    last_week = now - timedelta(weeks=1)
+    mon, sun = _week_date_range(last_week)
+    for mp3 in EPISODES_DIR.glob("noctua-*.mp3"):
+        date_str = mp3.stem.removeprefix("noctua-")
+        if mon <= date_str <= sun:
+            return True
+    return False
+
+
+def _monday_cleanup() -> None:
+    """Archive last week's MP3s, then clear episodes and digests for that week."""
+    now = _pst_now()
+    last_week = now - timedelta(weeks=1)
+    mon, sun = _week_date_range(last_week)
+    week_label = _iso_week_label(last_week)
+
+    # Collect last week's MP3s
+    mp3s = sorted(
+        mp3 for mp3 in EPISODES_DIR.glob("noctua-*.mp3")
+        if mon <= mp3.stem.removeprefix("noctua-") <= sun
+    )
+
+    # Archive into ZIP if MP3s exist and ZIP doesn't yet
+    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    zip_name = f"hootline-{week_label}.zip"
+    zip_path = EXPORTS_DIR / zip_name
+    if mp3s and not zip_path.exists():
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
+            for mp3 in mp3s:
+                zf.write(mp3, mp3.name)
+            digest_count = _add_digests_to_zip(zf, mon, sun)
+        logger.info("Archived %d episodes + %d digests to %s", len(mp3s), digest_count, zip_name)
+
+    # Delete ALL local noctua-*.mp3 files
+    for mp3 in EPISODES_DIR.glob("noctua-*.mp3"):
+        mp3.unlink()
+        logger.info("Deleted %s", mp3.name)
+
+    # Clear the RSS feed
+    feed_builder.clear_feed()
+
+    # Remove last week's digest rows
+    database.delete_digests_between(mon, sun)
+    logger.info("Monday cleanup complete for %s (%s to %s)", week_label, mon, sun)
+
+
+async def _maybe_monday_cleanup() -> None:
+    """Run Monday cleanup if it's Monday PST and last week's MP3s still exist."""
+    now = _pst_now()
+    if now.weekday() == 0 and _last_week_mp3s_exist():
+        logger.info("Monday PST detected — running weekly cleanup.")
+        _monday_cleanup()
 
 
 async def _scheduler() -> None:
@@ -93,6 +191,9 @@ async def _scheduler() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start the background scheduler and check for missed runs on startup."""
+    # Monday cleanup check on startup
+    await _maybe_monday_cleanup()
+
     # Check if we missed today's run (e.g. autoscale spun down during scheduled time)
     if _missed_todays_run():
         logger.info("Startup: missed today's scheduled run — triggering now.")
@@ -320,28 +421,82 @@ async def api_history():
 
 @app.get("/api/export-episodes")
 async def api_export_episodes():
-    """Bundle all local episode MP3s into a ZIP for download."""
+    """Bundle the current PST week's episode MP3s into a ZIP for download."""
     if not EPISODES_DIR.exists():
         return JSONResponse({"error": "No episodes directory found."}, status_code=404)
 
-    cutoff = (datetime.now(UTC) - timedelta(days=7)).strftime("%Y-%m-%d")
+    now = _pst_now()
+    mon, sun = _week_date_range(now)
+    week_label = _iso_week_label(now)
+
+    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    zip_name = f"hootline-{week_label}.zip"
+    zip_path = EXPORTS_DIR / zip_name
+
+    # Serve cached ZIP if it already exists for this week
+    if zip_path.exists():
+        return FileResponse(
+            zip_path,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+        )
+
     mp3_files = sorted(
         mp3 for mp3 in EPISODES_DIR.glob("noctua-*.mp3")
-        if mp3.stem.removeprefix("noctua-") >= cutoff
+        if mon <= mp3.stem.removeprefix("noctua-") <= sun
     )
     if not mp3_files:
-        return JSONResponse({"error": "No episodes from the last 7 days."}, status_code=404)
+        return JSONResponse({"error": "No episodes this week."}, status_code=404)
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
         for mp3 in mp3_files:
             zf.write(mp3, mp3.name)
-    buf.seek(0)
+        _add_digests_to_zip(zf, mon, sun)
+
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+    )
+
+
+@app.get("/api/export-weeks")
+async def api_export_weeks():
+    """List all pending (un-downloaded) weekly ZIPs."""
+    if not EXPORTS_DIR.exists():
+        return JSONResponse([])
+    zips = sorted(EXPORTS_DIR.glob("hootline-W*.zip"))
+    result = []
+    for z in zips:
+        # Extract week label from filename: hootline-W08-2026.zip -> W08-2026
+        label = z.stem.removeprefix("hootline-")
+        result.append({
+            "filename": z.name,
+            "size_bytes": z.stat().st_size,
+            "week_label": label,
+        })
+    return JSONResponse(result)
+
+
+@app.get("/api/download-export/{filename}")
+async def api_download_export(filename: str):
+    """Download a specific weekly ZIP and delete it afterward (marks as downloaded)."""
+    if ".." in filename or "/" in filename:
+        return Response(content="Invalid filename.", status_code=400)
+
+    zip_path = EXPORTS_DIR / filename
+    if not zip_path.exists():
+        return JSONResponse({"error": "Export not found."}, status_code=404)
+
+    # Read into memory so we can delete the file after sending
+    content = zip_path.read_bytes()
+    zip_path.unlink()
+    logger.info("Served and deleted export: %s", filename)
 
     return Response(
-        content=buf.getvalue(),
+        content=content,
         media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="hootline-episodes.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -955,24 +1110,53 @@ function drawRadar(topics, hasActual) {
 }
 
 // ===== HISTORY TAB =====
+function getWeekRange() {
+  // Compute current PST week (Mon-Sun) using UTC-8
+  const now = new Date(Date.now() - 8*3600000);
+  const day = now.getUTCDay(); // 0=Sun,...,6=Sat
+  const diffToMon = day === 0 ? -6 : 1 - day;
+  const mon = new Date(now);
+  mon.setUTCDate(mon.getUTCDate() + diffToMon);
+  const sun = new Date(mon);
+  sun.setUTCDate(sun.getUTCDate() + 6);
+  const fmt = d => d.toISOString().slice(0,10);
+  return { mon: fmt(mon), sun: fmt(sun) };
+}
+
 async function loadHistory() {
   const box = document.getElementById('hist-content');
   try {
-    const res = await fetch('/api/history');
-    const data = await res.json();
-    if (!data.rows || data.rows.length===0) { box.innerHTML='<div class="empty"><p>No digests yet.</p></div>'; return; }
+    const [histRes, weeksRes] = await Promise.all([fetch('/api/history'), fetch('/api/export-weeks')]);
+    const data = await histRes.json();
+    const pendingWeeks = await weeksRes.json();
 
-    // Export button — last 7 days only
-    const cutoff = new Date(Date.now() - 7*86400000).toISOString().slice(0,10);
-    const recent = data.rows.filter(r => r.has_audio && r.date >= cutoff);
-    const recentBytes = recent.reduce((s, r) => s + (r.file_size_bytes || 0), 0);
-    const recentMB = (recentBytes / 1048576).toFixed(1);
-    let h = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">';
-    h += '<span style="font-size:12px;color:var(--text-dim);">' + recent.length + ' episodes last 7 days &middot; ' + recentMB + ' MB</span>';
-    if (recent.length > 0) {
-      h += '<button class="btn" onclick="window.location=\\'/api/export-episodes\\'">Export Last 7 Days (ZIP)</button>';
+    if ((!data.rows || data.rows.length===0) && pendingWeeks.length===0) { box.innerHTML='<div class="empty"><p>No digests yet.</p></div>'; return; }
+
+    const week = getWeekRange();
+    const thisWeek = (data.rows||[]).filter(r => r.has_audio && r.date >= week.mon && r.date <= week.sun);
+    const weekBytes = thisWeek.reduce((s, r) => s + (r.file_size_bytes || 0), 0);
+    const weekMB = (weekBytes / 1048576).toFixed(1);
+
+    let h = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px;">';
+    h += '<span style="font-size:12px;color:var(--text-dim);">' + thisWeek.length + ' episodes this week &middot; ' + weekMB + ' MB</span>';
+    if (thisWeek.length > 0) {
+      h += '<button class="btn" onclick="window.location=\\'/api/export-episodes\\'">Export This Week (ZIP)</button>';
     }
     h += '</div>';
+
+    // Pending exports section
+    if (pendingWeeks.length > 0) {
+      h += '<div class="card" style="margin-bottom:16px;padding:16px;"><div class="card-label">Pending Exports</div>';
+      h += '<div style="display:flex;flex-direction:column;gap:6px;margin-top:8px;">';
+      for (const w of pendingWeeks) {
+        const mb = (w.size_bytes / 1048576).toFixed(1);
+        h += '<div style="display:flex;align-items:center;justify-content:space-between;">';
+        h += '<span style="font-size:12px;color:var(--text);">' + esc(w.week_label) + ' &middot; ' + mb + ' MB</span>';
+        h += '<a class="btn" href="/api/download-export/' + encodeURIComponent(w.filename) + '">Download</a>';
+        h += '</div>';
+      }
+      h += '</div></div>';
+    }
 
     h += '<table class="htable"><thead><tr><th>Date</th><th>Digest</th><th>Audio</th><th>Digest Details</th><th>Audio Details</th></tr></thead><tbody>';
     for (const r of data.rows) {
