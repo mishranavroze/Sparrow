@@ -158,12 +158,14 @@ async def api_latest_episode():
     if EPISODES_JSON.exists():
         episodes = json.loads(EPISODES_JSON.read_text())
         if episodes:
-            latest = sorted(episodes, key=lambda e: e["date"], reverse=True)[0]
-            audio_url = latest.get("gcs_url") or f"/episodes/noctua-{latest['date']}.mp3"
-            episode_data = {
-                **latest,
-                "audio_url": audio_url,
-            }
+            # Find the most recent episode that actually has a reachable audio file
+            for candidate in sorted(episodes, key=lambda e: e["date"], reverse=True):
+                gcs_url = candidate.get("gcs_url", "")
+                local_file = EPISODES_DIR / f"noctua-{candidate['date']}.mp3"
+                if gcs_url or local_file.exists():
+                    audio_url = gcs_url or f"/episodes/noctua-{candidate['date']}.mp3"
+                    episode_data = {**candidate, "audio_url": audio_url}
+                    break
 
     # Get the most recent digest (independent of episode date)
     digest_meta = None
@@ -197,18 +199,20 @@ async def api_episodes():
 async def api_topic_coverage(mode: str = Query("cumulative")):
     """Radar chart data: target vs actual topic coverage with suggestions.
 
+    Each topic's target is 100% (its full allocated time). Actual is the
+    percentage of that allocation covered, based on article counts.
+
     Args:
         mode: "cumulative" for all digests, "latest" for most recent only.
     """
     from src.topic_classifier import SEGMENT_DURATIONS, SEGMENT_ORDER
 
-    # Target percentages from segment durations
+    # Parse allocated minutes per topic
     duration_map = {}
     for topic, dur_str in SEGMENT_DURATIONS.items():
         minutes = int(dur_str.replace("~", "").replace(" minutes", "").replace(" minute", ""))
         duration_map[topic.value] = minutes
     total_minutes = sum(duration_map.values())
-    targets = {t: (m / total_minutes) * 100 for t, m in duration_map.items()}
 
     # Actual coverage from recent digests
     limit = 1 if mode == "latest" else 30
@@ -219,22 +223,30 @@ async def api_topic_coverage(mode: str = Query("cumulative")):
             totals[topic_name] = totals.get(topic_name, 0) + count
     grand_total = sum(totals.values())
     has_data = grand_total > 0
-    if grand_total == 0:
-        grand_total = 1  # avoid division by zero
-    actuals = {t.value: (totals.get(t.value, 0) / grand_total) * 100 for t in SEGMENT_ORDER}
 
-    # Build ordered topic list for the radar chart
+    # Per-topic actual as % of allocated time covered:
+    # expected_articles = (topic_minutes / total_minutes) * grand_total
+    # actual_pct = (actual_articles / expected_articles) * 100
+    # Target is always 100% (fully covered)
     topics = []
     for topic in SEGMENT_ORDER:
         name = topic.value
-        target_pct = targets.get(name, 0)
-        actual_pct = actuals.get(name, 0)
-        gap = actual_pct - target_pct
+        mins = duration_map.get(name, 1)
+        actual_articles = totals.get(name, 0)
+        if has_data:
+            expected = (mins / total_minutes) * grand_total
+            actual_pct = (actual_articles / expected) * 100 if expected > 0 else 0
+        else:
+            actual_pct = 0
+        gap = actual_pct - 100  # positive = over-covered, negative = under-covered
+        # Label includes allocated minutes
+        label = f"{name} ({mins}m)"
         topics.append({
-            "name": name,
-            "target_pct": round(target_pct, 1),
+            "name": label,
+            "target_pct": 100,
             "actual_pct": round(actual_pct, 1),
-            "actual_articles": totals.get(name, 0),
+            "actual_articles": actual_articles,
+            "allocated_min": mins,
             "gap": round(gap, 1),
         })
 
@@ -242,17 +254,17 @@ async def api_topic_coverage(mode: str = Query("cumulative")):
     suggestions = []
     if has_data:
         for t in topics:
-            if t["gap"] < -3:
+            if t["actual_pct"] < 30:
                 suggestions.append({
                     "topic": t["name"],
                     "action": "subscribe",
-                    "reason": f"Under-covered by {abs(t['gap']):.0f}pp — consider adding sources",
+                    "reason": f"Only {t['actual_pct']:.0f}% covered — consider adding sources",
                 })
-            elif t["gap"] > 5:
+            elif t["actual_pct"] > 200:
                 suggestions.append({
                     "topic": t["name"],
                     "action": "unsubscribe",
-                    "reason": f"Over-covered by {t['gap']:.0f}pp — consider reducing sources",
+                    "reason": f"{t['actual_pct']:.0f}% covered — consider reducing sources",
                 })
 
     return JSONResponse({
@@ -276,6 +288,10 @@ async def api_history():
     for d in digests:
         ep = ep_by_date.get(d["date"])
         full = database.get_digest(d["date"])
+        # Audio is only available if there's a GCS URL or the local file exists
+        gcs_url = ep.get("gcs_url", "") if ep else ""
+        local_file = EPISODES_DIR / f"noctua-{d['date']}.mp3"
+        has_audio = bool(gcs_url) or local_file.exists()
         rows.append({
             "date": d["date"],
             "article_count": d["article_count"],
@@ -283,11 +299,11 @@ async def api_history():
             "total_chars": len(full["markdown_text"]) if full else 0,
             "topics_summary": d["topics_summary"],
             "has_digest": True,
-            "has_audio": ep is not None,
+            "has_audio": has_audio,
             "duration_formatted": ep["duration_formatted"] if ep else None,
             "file_size_bytes": ep["file_size_bytes"] if ep else None,
             "rss_summary": ep.get("rss_summary", "") if ep else "",
-            "gcs_url": ep.get("gcs_url", "") if ep else "",
+            "gcs_url": gcs_url,
         })
 
     return JSONResponse({"rows": rows, "total": len(rows)})
@@ -813,7 +829,7 @@ async function loadRadar(mode) {
     h += '<button class="' + (radarMode==='latest'?'active':'') + '" onclick="loadRadar(\\'latest\\')">Latest</button>';
     h += '</div></div>';
     h += '<canvas id="radar-cv" width="380" height="380" style="display:block;margin:0 auto;"></canvas>';
-    h += '<div class="radar-legend"><span><span class="sw" style="background:rgba(196,160,82,0.6);"></span>Target</span>';
+    h += '<div class="radar-legend"><span><span class="sw" style="background:rgba(196,160,82,0.6);"></span>Target (100%)</span>';
     h += '<span><span class="sw" style="background:rgba(96,165,250,0.6);"></span>Actual</span></div>';
     const lbl = radarMode==='latest' ? 'latest digest' : data.digests_analyzed + ' digests';
     h += '<div class="radar-stats">' + lbl + ' &middot; ' + data.total_articles + ' articles' + (!data.has_data?' &middot; no coverage data yet':'') + '</div>';
@@ -843,17 +859,22 @@ function drawRadar(topics, hasActual) {
   if (!cv) return;
   const ctx = cv.getContext('2d');
   const W = cv.width, H = cv.height;
-  const cx = W/2, cy = H/2, R = Math.min(cx,cy)-52, n = topics.length, mx = 25;
+  const cx = W/2, cy = H/2, R = Math.min(cx,cy)-58, n = topics.length, mx = 150;
   ctx.clearRect(0,0,W,H);
 
   const ang = i => (Math.PI*2*i/n) - Math.PI/2;
   const pt = (i,p) => { const a=ang(i), r=(Math.min(p,mx)/mx)*R; return [cx+r*Math.cos(a), cy+r*Math.sin(a)]; };
 
-  // Grid
-  [5,10,15,20,25].forEach(r => {
+  // Grid rings at 50%, 100%, 150%
+  [50,100,150].forEach(r => {
     ctx.beginPath();
     for (let i=0;i<=n;i++) { const [x,y]=pt(i%n,r); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); }
-    ctx.closePath(); ctx.strokeStyle='#2e3140'; ctx.lineWidth=0.5; ctx.stroke();
+    ctx.closePath();
+    ctx.strokeStyle = r===100 ? '#4a4d5e' : '#2e3140';
+    ctx.lineWidth = r===100 ? 1.2 : 0.5;
+    ctx.stroke();
+    // Label the 100% ring
+    if (r===100) { ctx.font='8px monospace'; ctx.fillStyle='#5a5d6e'; ctx.textAlign='left'; ctx.fillText('100%',cx+3,cy-((r/mx)*R)-2); }
   });
 
   // Spokes
@@ -862,12 +883,11 @@ function drawRadar(topics, hasActual) {
     ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(x,y); ctx.strokeStyle='#2e3140'; ctx.lineWidth=0.5; ctx.stroke();
   }
 
-  // Target (gold)
+  // Target (gold) — always a circle at 100%
   ctx.beginPath();
-  for (let i=0;i<=n;i++) { const [x,y]=pt(i%n,topics[i%n].target_pct); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); }
-  ctx.closePath(); ctx.fillStyle='rgba(196,160,82,0.12)'; ctx.fill();
-  ctx.strokeStyle='rgba(196,160,82,0.7)'; ctx.lineWidth=2; ctx.stroke();
-  for (let i=0;i<n;i++) { const [x,y]=pt(i,topics[i].target_pct); ctx.beginPath(); ctx.arc(x,y,2.5,0,Math.PI*2); ctx.fillStyle='rgba(196,160,82,0.8)'; ctx.fill(); }
+  for (let i=0;i<=n;i++) { const [x,y]=pt(i%n,100); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); }
+  ctx.closePath(); ctx.fillStyle='rgba(196,160,82,0.08)'; ctx.fill();
+  ctx.strokeStyle='rgba(196,160,82,0.6)'; ctx.lineWidth=2; ctx.stroke();
 
   // Actual (blue)
   if (hasActual) {
@@ -878,13 +898,13 @@ function drawRadar(topics, hasActual) {
     for (let i=0;i<n;i++) { const [x,y]=pt(i,topics[i].actual_pct); ctx.beginPath(); ctx.arc(x,y,3,0,Math.PI*2); ctx.fillStyle='rgba(96,165,250,0.9)'; ctx.fill(); }
   }
 
-  // Labels
-  ctx.font='9px monospace'; ctx.fillStyle='#c8c8cc';
+  // Labels (topic name with allocated minutes)
+  ctx.font='8px monospace'; ctx.fillStyle='#c8c8cc';
   for (let i=0;i<n;i++) {
-    const a=ang(i), lr=R+22, x=cx+lr*Math.cos(a), y=cy+lr*Math.sin(a);
+    const a=ang(i), lr=R+24, x=cx+lr*Math.cos(a), y=cy+lr*Math.sin(a);
     ctx.textAlign = Math.abs(Math.cos(a))<0.15?'center':Math.cos(a)>0?'left':'right';
     ctx.textBaseline = Math.abs(Math.sin(a))<0.15?'middle':Math.sin(a)>0?'top':'bottom';
-    let l=topics[i].name; if(l.length>16) l=l.slice(0,14)+'..';
+    let l=topics[i].name; if(l.length>22) l=l.slice(0,20)+'..';
     ctx.fillText(l,x,y);
   }
 }
