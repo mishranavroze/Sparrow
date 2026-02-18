@@ -164,6 +164,27 @@ def list_digests(limit: int = 50) -> list[dict]:
         conn.close()
 
 
+def delete_digest(date: str) -> bool:
+    """Delete a single digest by date.
+
+    Args:
+        date: Date string (YYYY-MM-DD).
+
+    Returns:
+        True if a row was deleted, False otherwise.
+    """
+    conn = _get_connection()
+    try:
+        cursor = conn.execute("DELETE FROM digests WHERE date = ?", (date,))
+        conn.commit()
+        deleted = cursor.rowcount > 0
+        if deleted:
+            logger.info("Deleted digest for %s", date)
+        return deleted
+    finally:
+        conn.close()
+
+
 def delete_digests_between(start: str, end: str) -> int:
     """Delete digests in a date range (inclusive).
 

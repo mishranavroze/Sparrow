@@ -70,6 +70,11 @@ _generation_lock = asyncio.Lock()
 _generation_running = False
 _next_scheduled_run: datetime | None = None
 
+# --- Preparation workflow state ---
+_preparation_active = False
+_preparation_date: str | None = None
+_preparation_cancelled = False
+
 
 def _calc_next_run() -> datetime:
     """Calculate the next scheduled run time based on generation_hour and generation_minute."""
@@ -95,7 +100,7 @@ def _missed_todays_run() -> bool:
 
 async def _run_generation() -> None:
     """Run digest preparation (steps 1-3), guarded by a lock."""
-    global _generation_running
+    global _generation_running, _preparation_cancelled
     from generate import generate_digest_only
 
     if _generation_lock.locked():
@@ -107,10 +112,16 @@ async def _run_generation() -> None:
         try:
             await _maybe_monday_cleanup()
             await generate_digest_only()
+            # If cancelled while generating, discard the result
+            if _preparation_cancelled:
+                today_str = datetime.now(UTC).strftime("%Y-%m-%d")
+                database.delete_digest(today_str)
+                logger.info("Preparation cancelled — discarded digest for %s", today_str)
         except Exception as e:
             logger.error("Digest preparation failed: %s", e)
         finally:
             _generation_running = False
+            _preparation_cancelled = False
 
 
 def _last_week_mp3s_exist() -> bool:
@@ -287,9 +298,46 @@ async def api_latest_episode():
                 "locked": has_ep,
             }
 
+    # Build preparation state for the frontend
+    prep = None
+    if _preparation_active and _preparation_date:
+        prep_digest = database.get_digest(_preparation_date)
+        prep_mp3 = EPISODES_DIR / f"noctua-{_preparation_date}.mp3"
+        has_mp3 = prep_mp3.exists()
+
+        if _generation_running:
+            prep_state = "generating"
+        elif prep_digest and has_mp3:
+            prep_state = "audio_uploaded"
+        elif prep_digest:
+            prep_state = "digest_ready"
+        else:
+            prep_state = "generating"
+
+        prep = {
+            "active": True,
+            "generating": _generation_running,
+            "state": prep_state,
+            "date": _preparation_date,
+            "digest": {
+                "date": prep_digest["date"],
+                "article_count": prep_digest["article_count"],
+                "total_words": prep_digest["total_words"],
+                "total_chars": len(prep_digest["markdown_text"]),
+                "topics_summary": prep_digest["topics_summary"],
+                "download_url": f"/digests/{prep_digest['date']}.md",
+            } if prep_digest else None,
+            "audio": {
+                "date": _preparation_date,
+                "audio_url": f"/episodes/noctua-{_preparation_date}.mp3",
+                "file_size_bytes": prep_mp3.stat().st_size if has_mp3 else 0,
+            } if has_mp3 else None,
+        }
+
     return JSONResponse({
         "episode": episode_data,
         "digest": digest_meta,
+        "preparation": prep,
     })
 
 
@@ -653,6 +701,135 @@ async def api_cron_generate(secret: str = Query("")):
     return JSONResponse({"status": "started", "message": "Digest preparation started via cron."})
 
 
+@app.post("/api/start-preparation")
+async def api_start_preparation():
+    """Start the preparation workflow: generate a digest or return existing one."""
+    global _preparation_active, _preparation_date, _preparation_cancelled
+
+    today_str = datetime.now(UTC).strftime("%Y-%m-%d")
+
+    # If an episode is already published for today, reject
+    if database.has_episode(today_str):
+        return JSONResponse(
+            {"error": "Episode already published for today.", "state": "published"},
+            status_code=409,
+        )
+
+    _preparation_cancelled = False
+    _preparation_active = True
+    _preparation_date = today_str
+
+    # If digest already exists, skip generation
+    digest = database.get_digest(today_str)
+    if digest:
+        return JSONResponse({
+            "state": "digest_ready",
+            "date": today_str,
+            "digest": {
+                "date": digest["date"],
+                "article_count": digest["article_count"],
+                "total_words": digest["total_words"],
+                "total_chars": len(digest["markdown_text"]),
+                "topics_summary": digest["topics_summary"],
+                "download_url": f"/digests/{digest['date']}.md",
+            },
+        })
+
+    # No digest yet — trigger generation
+    if _generation_lock.locked():
+        return JSONResponse({
+            "state": "generating",
+            "date": today_str,
+            "message": "Generation already in progress.",
+        })
+
+    asyncio.create_task(_run_generation())
+    return JSONResponse({
+        "state": "generating",
+        "date": today_str,
+        "message": "Digest preparation started.",
+    })
+
+
+@app.post("/api/publish-episode")
+async def api_publish_episode(date: str = Form("")):
+    """Publish a prepared episode to RSS and archive."""
+    global _preparation_active
+
+    if not date or not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+        return JSONResponse({"error": "Invalid date format."}, status_code=400)
+
+    # Verify digest exists
+    digest = database.get_digest(date)
+    if not digest:
+        return JSONResponse({"error": f"No digest found for {date}."}, status_code=404)
+
+    # Verify MP3 exists on disk
+    mp3_path = EPISODES_DIR / f"noctua-{date}.mp3"
+    if not mp3_path.exists():
+        return JSONResponse({"error": f"No audio file found for {date}."}, status_code=404)
+
+    # Process episode (GCS upload + cleanup)
+    try:
+        topics_summary = digest.get("topics_summary", "")
+        rss_summary = digest.get("rss_summary", "")
+        metadata = episode_manager.process(mp3_path, topics_summary, rss_summary)
+    except Exception as e:
+        return JSONResponse(
+            {"error": f"Episode processing failed: {e}"},
+            status_code=422,
+        )
+
+    # Publish to RSS feed + archive to DB
+    try:
+        feed_builder.add_episode(metadata)
+    except Exception as e:
+        return JSONResponse(
+            {"error": f"Feed update failed: {e}"},
+            status_code=500,
+        )
+
+    _preparation_active = False
+
+    return JSONResponse({
+        "status": "ok",
+        "message": f"Episode for {date} published to RSS.",
+        "feed_url": f"{settings.base_url}/feed.xml",
+        "episode": {
+            "date": metadata.date,
+            "duration_formatted": metadata.duration_formatted,
+            "file_size_bytes": metadata.file_size_bytes,
+            "topics_summary": metadata.topics_summary,
+            "gcs_url": metadata.gcs_url,
+        },
+    })
+
+
+@app.post("/api/cancel-preparation")
+async def api_cancel_preparation():
+    """Cancel the preparation workflow, discarding digest and MP3."""
+    global _preparation_active, _preparation_cancelled, _preparation_date
+
+    if _generation_running:
+        _preparation_cancelled = True
+        logger.info("Preparation cancel requested — will discard after generation completes.")
+
+    # Delete digest for the preparation date
+    if _preparation_date:
+        # Only delete digest if no episode exists (don't touch published data)
+        if not database.has_episode(_preparation_date):
+            database.delete_digest(_preparation_date)
+
+        # Delete MP3 from disk
+        mp3_path = EPISODES_DIR / f"noctua-{_preparation_date}.mp3"
+        mp3_path.unlink(missing_ok=True)
+
+    _preparation_active = False
+    _preparation_date = None
+
+    return JSONResponse({"status": "ok", "message": "Preparation cancelled."})
+
+
 @app.post("/api/upload-episode")
 async def api_upload_episode(file: UploadFile, date: str = Form("")):
     """Upload an MP3 episode for a given digest date."""
@@ -730,37 +907,31 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
                 status_code=500,
             )
 
-    # Process episode (validate MP3, extract metadata)
+    # Validate MP3 and extract metadata (no publishing)
     try:
-        topics_summary = digest.get("topics_summary", "")
-        rss_summary = digest.get("rss_summary", "")
-        metadata = episode_manager.process(mp3_path, topics_summary, rss_summary)
+        from src.episode_manager import _ensure_mp3, _format_duration
+        mp3_path = _ensure_mp3(mp3_path)
+        from mutagen.mp3 import MP3
+        audio = MP3(str(mp3_path))
+        duration_seconds = int(audio.info.length)
+        duration_formatted = _format_duration(duration_seconds)
+        file_size_bytes = mp3_path.stat().st_size
     except Exception as e:
         mp3_path.unlink(missing_ok=True)
         return JSONResponse(
-            {"error": f"Episode processing failed: {e}"},
+            {"error": f"Audio validation failed: {e}"},
             status_code=422,
-        )
-
-    # Publish to RSS feed
-    try:
-        feed_builder.add_episode(metadata)
-    except Exception as e:
-        return JSONResponse(
-            {"error": f"Feed update failed: {e}"},
-            status_code=500,
         )
 
     return JSONResponse({
         "status": "ok",
-        "message": f"Episode for {date} published.",
-        "feed_url": f"{settings.base_url}/feed.xml",
+        "message": f"Audio for {date} uploaded. Preview ready — publish when ready.",
         "episode": {
-            "date": metadata.date,
-            "duration_formatted": metadata.duration_formatted,
-            "file_size_bytes": metadata.file_size_bytes,
-            "topics_summary": metadata.topics_summary,
-            "gcs_url": metadata.gcs_url,
+            "date": date,
+            "duration_formatted": duration_formatted,
+            "duration_seconds": duration_seconds,
+            "file_size_bytes": file_size_bytes,
+            "audio_url": f"/episodes/noctua-{date}.mp3",
         },
     })
 
@@ -1003,15 +1174,28 @@ function esc(s) {
 }
 
 // ===== LATEST TAB =====
+let _prepActive = false;
+
 async function loadLatest() {
   const res = await fetch('/api/latest-episode');
   const data = await res.json();
   const left = document.getElementById('left-col');
 
+  // If preparation workflow is active, render that instead
+  if (data.preparation && data.preparation.active) {
+    _prepActive = true;
+    renderPreparation(data.preparation);
+    updateGenBtn(null, true);
+    loadRadar(radarMode, 'right-col');
+    return;
+  }
+
+  _prepActive = false;
+
   if (!data.episode && !data.digest) {
     left.innerHTML = '<div class="empty"><div class="owl">&#x1F989;</div><p>No episodes yet.<br>Click <strong>Prepare Digest</strong> to fetch today\\'s newsletters, then upload audio from NotebookLM.</p></div>';
     document.getElementById('right-col').innerHTML = '';
-    updateGenBtn(null);
+    updateGenBtn(null, false);
     return;
   }
 
@@ -1038,8 +1222,58 @@ async function loadLatest() {
   }
 
   left.innerHTML = h;
-  updateGenBtn(data.digest);
+  updateGenBtn(data.digest, false);
   loadRadar(radarMode, 'right-col');
+}
+
+function renderPreparation(prep) {
+  const left = document.getElementById('left-col');
+  let h = '';
+
+  if (prep.state === 'generating') {
+    h += '<div class="card"><div class="card-label">Preparing Digest</div>';
+    h += '<p style="color:var(--text-dim);font-size:13px;">Processing... fetching newsletters and generating digest.</p>';
+    h += '</div>';
+    left.innerHTML = h;
+    // Poll until generation finishes
+    setTimeout(() => loadLatest(), 5000);
+    return;
+  }
+
+  if (prep.state === 'digest_ready' && prep.digest) {
+    const d = prep.digest;
+    h += '<div class="card"><div class="card-label">Digest Ready</div><div class="digest-row"><div>';
+    h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + d.total_words.toLocaleString() + ' words &middot; ' + d.total_chars.toLocaleString() + ' chars</div>';
+    h += '<div class="digest-topics">' + esc(d.topics_summary||'') + '</div>';
+    h += '</div><a class="dl-btn" href="' + d.download_url + '" download>Download .md</a></div></div>';
+
+    // Upload section
+    h += '<div class="card"><div class="card-label">Upload Audio</div>';
+    h += '<div class="upload-row"><input type="file" id="mp3-file" accept=".mp3,.m4a,.wav,.ogg,.webm">';
+    h += '<button class="up-btn" id="up-btn" onclick="uploadEp(\\'' + d.date + '\\')">Upload</button></div>';
+    h += '<div class="upload-status" id="up-status"></div></div>';
+  }
+
+  if (prep.state === 'audio_uploaded' && prep.digest) {
+    const d = prep.digest;
+    h += '<div class="card"><div class="card-label">Digest Ready</div><div class="digest-row"><div>';
+    h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + d.total_words.toLocaleString() + ' words &middot; ' + d.total_chars.toLocaleString() + ' chars</div>';
+    h += '<div class="digest-topics">' + esc(d.topics_summary||'') + '</div>';
+    h += '</div><a class="dl-btn" href="' + d.download_url + '" download>Download .md</a></div></div>';
+
+    // Audio preview + publish button
+    h += '<div class="card"><div class="card-label">Audio Preview</div>';
+    if (prep.audio) {
+      const mb = (prep.audio.file_size_bytes / 1048576).toFixed(1);
+      h += '<div class="ep-meta"><span>' + mb + ' MB</span></div>';
+      h += '<audio controls preload="metadata" src="' + prep.audio.audio_url + '"></audio>';
+    }
+    h += '<div style="margin-top:12px;">';
+    h += '<button class="up-btn" onclick="publishEp(\\'' + prep.date + '\\')">Publish to RSS</button>';
+    h += '</div></div>';
+  }
+
+  left.innerHTML = h;
 }
 
 // ===== RADAR =====
@@ -1248,45 +1482,74 @@ async function loadHistory() {
 // ===== ACTIONS =====
 let _digestState = null; // tracks current digest state for button logic
 
-function updateGenBtn(digest) {
+function updateGenBtn(digest, prepActive) {
   _digestState = digest;
   const btn = document.getElementById('gen-btn');
   if (!btn) return;
-  if (digest && digest.locked) {
-    // Episode uploaded — locked, show re-prepare for next cycle
+  if (prepActive) {
+    btn.textContent = 'Cancel';
+    btn.disabled = false;
+    btn.onclick = () => cancelPrep();
+  } else if (digest && digest.locked) {
     btn.textContent = 'Prepare New Digest';
     btn.disabled = false;
-    btn.onclick = () => triggerGen(true);
+    btn.onclick = () => startPrep();
   } else if (digest) {
-    // Digest exists, no episode — show discard option
-    btn.textContent = 'Discard & Re-prepare';
+    btn.textContent = 'Prepare New Digest';
     btn.disabled = false;
-    btn.onclick = () => triggerGen(true);
+    btn.onclick = () => startPrep();
   } else {
     btn.textContent = 'Prepare Digest';
     btn.disabled = false;
-    btn.onclick = () => triggerGen(false);
+    btn.onclick = () => startPrep();
   }
 }
 
-async function triggerGen(force) {
+async function startPrep() {
   const btn = document.getElementById('gen-btn');
   btn.disabled = true; btn.textContent = 'Preparing...';
-  const url = '/api/generate' + (force ? '?force=true' : '');
   try {
-    const res = await fetch(url, {method:'POST'});
+    const res = await fetch('/api/start-preparation', {method:'POST'});
     const data = await res.json();
-    if (!res.ok && data.status === 'locked') {
-      btn.disabled = false; btn.textContent = 'Prepare New Digest';
+    if (!res.ok) {
+      btn.disabled = false;
+      btn.textContent = 'Prepare Digest';
       return;
     }
+    _prepActive = true;
+    loadLatest();
+  } catch(e) {
+    btn.disabled = false; btn.textContent = 'Prepare Digest';
+  }
+}
+
+async function cancelPrep() {
+  const btn = document.getElementById('gen-btn');
+  btn.disabled = true; btn.textContent = 'Cancelling...';
+  try {
+    await fetch('/api/cancel-preparation', {method:'POST'});
   } catch(e) {}
-  const poll = setInterval(async () => {
-    try {
-      const h = await (await fetch('/health')).json();
-      if (!h.generation_running) { clearInterval(poll); loadLatest(); }
-    } catch(e) {}
-  }, 5000);
+  _prepActive = false;
+  loadLatest();
+}
+
+async function publishEp(date) {
+  const btn = event.target;
+  btn.disabled = true; btn.textContent = 'Publishing...';
+  const form = new FormData(); form.append('date', date);
+  try {
+    const res = await fetch('/api/publish-episode', {method:'POST', body:form});
+    const data = await res.json();
+    if (res.ok) {
+      _prepActive = false;
+      loadLatest();
+    } else {
+      btn.disabled = false; btn.textContent = 'Publish to RSS';
+      alert(data.error || 'Publish failed.');
+    }
+  } catch(e) {
+    btn.disabled = false; btn.textContent = 'Publish to RSS';
+  }
 }
 
 async function uploadEp(date) {
@@ -1302,8 +1565,8 @@ async function uploadEp(date) {
     const data = await res.json();
     if (res.ok) {
       st.className='upload-status success';
-      st.innerHTML = data.message + ' <a href="/feed.xml" style="color:var(--accent);">View Feed</a>';
-      setTimeout(() => loadLatest(), 2000);
+      st.textContent = data.message;
+      setTimeout(() => loadLatest(), 1000);
     } else { st.className='upload-status error'; st.textContent=data.error||'Upload failed.'; }
   } catch(e) { st.className='upload-status error'; st.textContent='Network error.'; }
   btn.disabled=false; btn.textContent='Upload';
@@ -1314,8 +1577,9 @@ async function updateHealth() {
     const h = await (await fetch('/health')).json();
     const btn = document.getElementById('gen-btn');
     const info = document.getElementById('sched-info');
-    if (h.generation_running) { btn.disabled=true; btn.textContent='Preparing...'; }
-    else if (_digestState !== undefined) { updateGenBtn(_digestState); }
+    if (_prepActive && h.generation_running) { btn.disabled=true; btn.textContent='Preparing...'; }
+    else if (_prepActive) { updateGenBtn(null, true); }
+    else if (_digestState !== undefined) { updateGenBtn(_digestState, false); }
     if (h.next_scheduled_run) {
       const next = new Date(h.next_scheduled_run);
       info.textContent = 'Next: ' + next.toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
