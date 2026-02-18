@@ -103,12 +103,14 @@ def has_episode(date: str) -> bool:
 def save_digest(date: str, markdown_text: str, article_count: int,
                 total_words: int, topics_summary: str, rss_summary: str = "",
                 segment_counts: dict[str, int] | None = None,
-                segment_sources: dict[str, list[str]] | None = None) -> None:
+                segment_sources: dict[str, list[str]] | None = None,
+                force: bool = False) -> None:
     """Save or update a daily digest.
 
-    Refuses to overwrite if an episode already exists for this date (locked).
+    Refuses to overwrite if an episode already exists for this date (locked),
+    unless force=True (used when user explicitly publishes a new episode).
     """
-    if has_episode(date):
+    if not force and has_episode(date):
         logger.warning("Digest for %s is locked (episode exists) — skipping overwrite.", date)
         return
 
@@ -228,6 +230,27 @@ def get_topic_coverage(limit: int = 30) -> list[dict]:
 
 
 # --- Episode Archive ---
+
+def delete_episode(date: str) -> bool:
+    """Delete an episode record by date.
+
+    Args:
+        date: Date string (YYYY-MM-DD).
+
+    Returns:
+        True if a row was deleted, False otherwise.
+    """
+    conn = _get_connection()
+    try:
+        cursor = conn.execute("DELETE FROM episodes WHERE date = ?", (date,))
+        conn.commit()
+        deleted = cursor.rowcount > 0
+        if deleted:
+            logger.info("Deleted episode record for %s", date)
+        return deleted
+    finally:
+        conn.close()
+
 
 def save_episode(date: str, file_size_bytes: int, duration_seconds: int,
                  duration_formatted: str, topics_summary: str,

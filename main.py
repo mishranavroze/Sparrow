@@ -74,6 +74,8 @@ _next_scheduled_run: datetime | None = None
 _preparation_active = False
 _preparation_date: str | None = None
 _preparation_cancelled = False
+_preparation_digest = None  # CompiledDigest stored in memory during preparation
+_preparation_error: str | None = None  # Error message if generation failed
 
 
 def _calc_next_run() -> datetime:
@@ -100,7 +102,7 @@ def _missed_todays_run() -> bool:
 
 async def _run_generation() -> None:
     """Run digest preparation (steps 1-3), guarded by a lock."""
-    global _generation_running, _preparation_cancelled
+    global _generation_running, _preparation_cancelled, _preparation_digest, _preparation_error
     from generate import generate_digest_only
 
     if _generation_lock.locked():
@@ -111,14 +113,35 @@ async def _run_generation() -> None:
         _generation_running = True
         try:
             await _maybe_monday_cleanup()
-            await generate_digest_only()
-            # If cancelled while generating, discard the result
-            if _preparation_cancelled:
-                today_str = datetime.now(UTC).strftime("%Y-%m-%d")
-                database.delete_digest(today_str)
-                logger.info("Preparation cancelled — discarded digest for %s", today_str)
+
+            if _preparation_active:
+                # During preparation: suppress DB save, keep digest in memory only
+                # so existing History/RSS data stays untouched until Publish.
+                original_save = database.save_digest
+                database.save_digest = lambda *args, **kwargs: None
+                try:
+                    result = await generate_digest_only()
+                finally:
+                    database.save_digest = original_save
+
+                if _preparation_cancelled:
+                    _preparation_digest = None
+                    _preparation_error = None
+                    logger.info("Preparation cancelled — discarded in-memory digest")
+                elif result is None:
+                    _preparation_digest = None
+                    _preparation_error = "No newsletters found — nothing to prepare."
+                    logger.info("Preparation returned no digest (no emails/articles)")
+                else:
+                    _preparation_digest = result
+                    _preparation_error = None
+                    logger.info("Preparation digest ready (in-memory only)")
+            else:
+                await generate_digest_only()
         except Exception as e:
             logger.error("Digest preparation failed: %s", e)
+            if _preparation_active:
+                _preparation_error = f"Generation failed: {e}"
         finally:
             _generation_running = False
             _preparation_cancelled = False
@@ -228,10 +251,13 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # --- Dashboard ---
 
-@app.get("/", response_class=HTMLResponse)
-async def dashboard() -> str:
+@app.get("/")
+async def dashboard():
     """Main dashboard showing latest episode with audio player and digest."""
-    return DASHBOARD_HTML
+    return HTMLResponse(
+        content=DASHBOARD_HTML,
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 @app.get("/api/digests")
@@ -301,35 +327,42 @@ async def api_latest_episode():
     # Build preparation state for the frontend
     prep = None
     if _preparation_active and _preparation_date:
-        prep_digest = database.get_digest(_preparation_date)
-        prep_mp3 = EPISODES_DIR / f"noctua-{_preparation_date}.mp3"
+        prep_mp3 = EPISODES_DIR / f"noctua-{_preparation_date}.prep.mp3"
         has_mp3 = prep_mp3.exists()
+        has_digest = _preparation_digest is not None
 
         if _generation_running:
             prep_state = "generating"
-        elif prep_digest and has_mp3:
+        elif _preparation_error:
+            prep_state = "failed"
+        elif has_digest and has_mp3:
             prep_state = "audio_uploaded"
-        elif prep_digest:
+        elif has_digest:
             prep_state = "digest_ready"
         else:
             prep_state = "generating"
+
+        # Check if there's an existing published episode for this date
+        existing_episode = database.has_episode(_preparation_date)
 
         prep = {
             "active": True,
             "generating": _generation_running,
             "state": prep_state,
             "date": _preparation_date,
+            "existing_episode": existing_episode,
+            "error": _preparation_error,
             "digest": {
-                "date": prep_digest["date"],
-                "article_count": prep_digest["article_count"],
-                "total_words": prep_digest["total_words"],
-                "total_chars": len(prep_digest["markdown_text"]),
-                "topics_summary": prep_digest["topics_summary"],
-                "download_url": f"/digests/{prep_digest['date']}.md",
-            } if prep_digest else None,
+                "date": _preparation_digest.date,
+                "article_count": _preparation_digest.article_count,
+                "total_words": _preparation_digest.total_words,
+                "total_chars": len(_preparation_digest.text),
+                "topics_summary": _preparation_digest.topics_summary,
+                "download_url": "/api/preparation-digest",
+            } if has_digest else None,
             "audio": {
                 "date": _preparation_date,
-                "audio_url": f"/episodes/noctua-{_preparation_date}.mp3",
+                "audio_url": f"/episodes/noctua-{_preparation_date}.prep.mp3",
                 "file_size_bytes": prep_mp3.stat().st_size if has_mp3 else 0,
             } if has_mp3 else None,
         }
@@ -703,39 +736,21 @@ async def api_cron_generate(secret: str = Query("")):
 
 @app.post("/api/start-preparation")
 async def api_start_preparation():
-    """Start the preparation workflow: generate a digest or return existing one."""
-    global _preparation_active, _preparation_date, _preparation_cancelled
+    """Start the preparation workflow: generate a new digest (always).
+
+    Existing episode/digest in History and RSS are untouched until Publish.
+    The new digest is held in memory only.
+    """
+    global _preparation_active, _preparation_date, _preparation_cancelled, _preparation_digest, _preparation_error
 
     today_str = datetime.now(UTC).strftime("%Y-%m-%d")
-
-    # If an episode is already published for today, reject
-    if database.has_episode(today_str):
-        return JSONResponse(
-            {"error": "Episode already published for today.", "state": "published"},
-            status_code=409,
-        )
 
     _preparation_cancelled = False
     _preparation_active = True
     _preparation_date = today_str
+    _preparation_digest = None
+    _preparation_error = None
 
-    # If digest already exists, skip generation
-    digest = database.get_digest(today_str)
-    if digest:
-        return JSONResponse({
-            "state": "digest_ready",
-            "date": today_str,
-            "digest": {
-                "date": digest["date"],
-                "article_count": digest["article_count"],
-                "total_words": digest["total_words"],
-                "total_chars": len(digest["markdown_text"]),
-                "topics_summary": digest["topics_summary"],
-                "download_url": f"/digests/{digest['date']}.md",
-            },
-        })
-
-    # No digest yet — trigger generation
     if _generation_lock.locked():
         return JSONResponse({
             "state": "generating",
@@ -751,29 +766,60 @@ async def api_start_preparation():
     })
 
 
+@app.get("/api/preparation-digest")
+async def api_preparation_digest():
+    """Serve the in-memory preparation digest as a downloadable .md file."""
+    if not _preparation_digest:
+        return Response(content="No preparation digest available.", status_code=404)
+    return Response(
+        content=_preparation_digest.text,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="noctua-digest-{_preparation_digest.date}.md"'},
+    )
+
+
 @app.post("/api/publish-episode")
 async def api_publish_episode(date: str = Form("")):
-    """Publish a prepared episode to RSS and archive."""
-    global _preparation_active
+    """Publish a prepared episode to RSS and archive.
+
+    Saves the in-memory preparation digest to DB (with force to bypass
+    episode lock), then processes the prep MP3 and publishes to RSS.
+    """
+    global _preparation_active, _preparation_digest
 
     if not date or not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
         return JSONResponse({"error": "Invalid date format."}, status_code=400)
 
-    # Verify digest exists
-    digest = database.get_digest(date)
-    if not digest:
-        return JSONResponse({"error": f"No digest found for {date}."}, status_code=404)
+    # Use the in-memory preparation digest
+    if not _preparation_digest or _preparation_digest.date != date:
+        return JSONResponse({"error": "No preparation digest available for this date."}, status_code=404)
 
-    # Verify MP3 exists on disk
+    # Verify prep MP3 exists on disk
+    prep_mp3 = EPISODES_DIR / f"noctua-{date}.prep.mp3"
+    if not prep_mp3.exists():
+        return JSONResponse({"error": f"No uploaded audio found for {date}."}, status_code=404)
+
+    # Rename prep MP3 to canonical name (overwrites old episode MP3)
     mp3_path = EPISODES_DIR / f"noctua-{date}.mp3"
-    if not mp3_path.exists():
-        return JSONResponse({"error": f"No audio file found for {date}."}, status_code=404)
+    prep_mp3.rename(mp3_path)
 
-    # Process episode (GCS upload + cleanup)
+    # Save the preparation digest to DB (force bypasses episode lock)
+    digest = _preparation_digest
+    database.save_digest(
+        date=digest.date,
+        markdown_text=digest.text,
+        article_count=digest.article_count,
+        total_words=digest.total_words,
+        topics_summary=digest.topics_summary,
+        rss_summary=digest.rss_summary,
+        segment_counts=digest.segment_counts,
+        segment_sources=digest.segment_sources,
+        force=True,
+    )
+
+    # Process episode (validate MP3, extract metadata, GCS upload, cleanup)
     try:
-        topics_summary = digest.get("topics_summary", "")
-        rss_summary = digest.get("rss_summary", "")
-        metadata = episode_manager.process(mp3_path, topics_summary, rss_summary)
+        metadata = episode_manager.process(mp3_path, digest.topics_summary, digest.rss_summary)
     except Exception as e:
         return JSONResponse(
             {"error": f"Episode processing failed: {e}"},
@@ -790,6 +836,7 @@ async def api_publish_episode(date: str = Form("")):
         )
 
     _preparation_active = False
+    _preparation_digest = None
 
     return JSONResponse({
         "status": "ok",
@@ -807,32 +854,37 @@ async def api_publish_episode(date: str = Form("")):
 
 @app.post("/api/cancel-preparation")
 async def api_cancel_preparation():
-    """Cancel the preparation workflow, discarding digest and MP3."""
-    global _preparation_active, _preparation_cancelled, _preparation_date
+    """Cancel the preparation workflow.
+
+    Only discards in-memory digest and prep MP3.
+    Existing episode/digest in DB and RSS are untouched.
+    """
+    global _preparation_active, _preparation_cancelled, _preparation_date, _preparation_digest, _preparation_error
 
     if _generation_running:
         _preparation_cancelled = True
         logger.info("Preparation cancel requested — will discard after generation completes.")
 
-    # Delete digest for the preparation date
+    # Delete only the prep MP3 (old canonical MP3 is untouched)
     if _preparation_date:
-        # Only delete digest if no episode exists (don't touch published data)
-        if not database.has_episode(_preparation_date):
-            database.delete_digest(_preparation_date)
-
-        # Delete MP3 from disk
-        mp3_path = EPISODES_DIR / f"noctua-{_preparation_date}.mp3"
-        mp3_path.unlink(missing_ok=True)
+        prep_mp3 = EPISODES_DIR / f"noctua-{_preparation_date}.prep.mp3"
+        prep_mp3.unlink(missing_ok=True)
 
     _preparation_active = False
     _preparation_date = None
+    _preparation_digest = None
+    _preparation_error = None
 
     return JSONResponse({"status": "ok", "message": "Preparation cancelled."})
 
 
 @app.post("/api/upload-episode")
 async def api_upload_episode(file: UploadFile, date: str = Form("")):
-    """Upload an MP3 episode for a given digest date."""
+    """Upload audio for a given digest date (preview only, no publishing).
+
+    During preparation, saves as .prep.mp3 so the existing episode MP3
+    is not overwritten until Publish.
+    """
     # Validate date format
     if not date or not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
         return JSONResponse(
@@ -849,9 +901,9 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
             status_code=400,
         )
 
-    # Check digest exists for that date
-    digest = database.get_digest(date)
-    if not digest:
+    # Check that a digest is available (either in memory during prep or in DB)
+    has_digest = (_preparation_digest and _preparation_digest.date == date) or database.get_digest(date) is not None
+    if not has_digest:
         return JSONResponse(
             {"error": f"No digest found for {date}. Prepare a digest first."},
             status_code=404,
@@ -867,10 +919,10 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
             status_code=400,
         )
 
-    # Save uploaded file
+    # Save to .prep.mp3 during preparation so existing episode MP3 stays intact
     EPISODES_DIR.mkdir(parents=True, exist_ok=True)
-    mp3_path = EPISODES_DIR / f"noctua-{date}.mp3"
-    upload_path = EPISODES_DIR / f"noctua-{date}{ext}"
+    mp3_path = EPISODES_DIR / f"noctua-{date}.prep.mp3"
+    upload_path = EPISODES_DIR / f"noctua-{date}.prep{ext}"
     try:
         contents = await file.read()
         if len(contents) == 0:
@@ -931,7 +983,7 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
             "duration_formatted": duration_formatted,
             "duration_seconds": duration_seconds,
             "file_size_bytes": file_size_bytes,
-            "audio_url": f"/episodes/noctua-{date}.mp3",
+            "audio_url": f"/episodes/noctua-{date}.prep.mp3",
         },
     })
 
@@ -1128,7 +1180,7 @@ DASHBOARD_HTML = """\
   </div>
   <div class="actions">
     <span style="font-size:10px;color:var(--text-dim);" id="sched-info"></span>
-    <button class="btn" id="gen-btn">Prepare Digest</button>
+    <button class="btn" id="gen-btn" onclick="startPrep()">Prepare Digest</button>
     <a class="btn" href="/feed.xml">RSS Feed</a>
   </div>
 </header>
@@ -1177,8 +1229,15 @@ function esc(s) {
 let _prepActive = false;
 
 async function loadLatest() {
-  const res = await fetch('/api/latest-episode');
-  const data = await res.json();
+  let res, data;
+  try {
+    res = await fetch('/api/latest-episode');
+    data = await res.json();
+  } catch(e) {
+    console.error('loadLatest fetch error:', e);
+    document.getElementById('left-col').innerHTML = '<div class="empty"><p>Failed to load. Check console.</p></div>';
+    return;
+  }
   const left = document.getElementById('left-col');
 
   // If preparation workflow is active, render that instead
@@ -1240,27 +1299,34 @@ function renderPreparation(prep) {
     return;
   }
 
-  if (prep.state === 'digest_ready' && prep.digest) {
+  if (prep.state === 'failed') {
+    h += '<div class="card"><div class="card-label" style="color:#e74c3c;">Preparation Failed</div>';
+    h += '<p style="color:var(--text-dim);font-size:13px;">' + esc(prep.error || 'Unknown error.') + '</p>';
+    h += '<p style="margin-top:8px;font-size:12px;color:var(--text-dim);">Click <strong>Cancel</strong> to return, or try again.</p>';
+    h += '</div>';
+    left.innerHTML = h;
+    loadRadar(radarMode, 'right-col');
+    return;
+  }
+
+  // Digest card (shared by digest_ready and audio_uploaded)
+  if (prep.digest) {
     const d = prep.digest;
-    h += '<div class="card"><div class="card-label">Digest Ready</div><div class="digest-row"><div>';
+    h += '<div class="card"><div class="card-label">New Digest Ready</div><div class="digest-row"><div>';
     h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + d.total_words.toLocaleString() + ' words &middot; ' + d.total_chars.toLocaleString() + ' chars</div>';
     h += '<div class="digest-topics">' + esc(d.topics_summary||'') + '</div>';
     h += '</div><a class="dl-btn" href="' + d.download_url + '" download>Download .md</a></div></div>';
+  }
 
+  if (prep.state === 'digest_ready') {
     // Upload section
     h += '<div class="card"><div class="card-label">Upload Audio</div>';
     h += '<div class="upload-row"><input type="file" id="mp3-file" accept=".mp3,.m4a,.wav,.ogg,.webm">';
-    h += '<button class="up-btn" id="up-btn" onclick="uploadEp(\\'' + d.date + '\\')">Upload</button></div>';
+    h += '<button class="up-btn" id="up-btn" onclick="uploadEp(\\'' + prep.date + '\\')">Upload</button></div>';
     h += '<div class="upload-status" id="up-status"></div></div>';
   }
 
-  if (prep.state === 'audio_uploaded' && prep.digest) {
-    const d = prep.digest;
-    h += '<div class="card"><div class="card-label">Digest Ready</div><div class="digest-row"><div>';
-    h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + d.total_words.toLocaleString() + ' words &middot; ' + d.total_chars.toLocaleString() + ' chars</div>';
-    h += '<div class="digest-topics">' + esc(d.topics_summary||'') + '</div>';
-    h += '</div><a class="dl-btn" href="' + d.download_url + '" download>Download .md</a></div></div>';
-
+  if (prep.state === 'audio_uploaded') {
     // Audio preview + publish button
     h += '<div class="card"><div class="card-label">Audio Preview</div>';
     if (prep.audio) {
@@ -1268,8 +1334,13 @@ function renderPreparation(prep) {
       h += '<div class="ep-meta"><span>' + mb + ' MB</span></div>';
       h += '<audio controls preload="metadata" src="' + prep.audio.audio_url + '"></audio>';
     }
+    if (prep.existing_episode) {
+      h += '<div style="margin-top:10px;padding:8px 12px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.25);border-radius:6px;font-size:11px;color:var(--yellow);">';
+      h += 'This will replace today\\'s existing episode in the RSS feed and History.';
+      h += '</div>';
+    }
     h += '<div style="margin-top:12px;">';
-    h += '<button class="up-btn" onclick="publishEp(\\'' + prep.date + '\\')">Publish to RSS</button>';
+    h += '<button class="up-btn" onclick="publishEp(\\'' + prep.date + '\\',' + (prep.existing_episode?'true':'false') + ')">Publish to RSS</button>';
     h += '</div></div>';
   }
 
@@ -1490,10 +1561,6 @@ function updateGenBtn(digest, prepActive) {
     btn.textContent = 'Cancel';
     btn.disabled = false;
     btn.onclick = () => cancelPrep();
-  } else if (digest && digest.locked) {
-    btn.textContent = 'Prepare New Digest';
-    btn.disabled = false;
-    btn.onclick = () => startPrep();
   } else if (digest) {
     btn.textContent = 'Prepare New Digest';
     btn.disabled = false;
@@ -1507,19 +1574,24 @@ function updateGenBtn(digest, prepActive) {
 
 async function startPrep() {
   const btn = document.getElementById('gen-btn');
+  _prepActive = true;
   btn.disabled = true; btn.textContent = 'Preparing...';
   try {
     const res = await fetch('/api/start-preparation', {method:'POST'});
     const data = await res.json();
     if (!res.ok) {
+      _prepActive = false;
       btn.disabled = false;
-      btn.textContent = 'Prepare Digest';
+      updateGenBtn(_digestState, false);
+      if (data.error) alert(data.error);
       return;
     }
-    _prepActive = true;
     loadLatest();
   } catch(e) {
-    btn.disabled = false; btn.textContent = 'Prepare Digest';
+    _prepActive = false;
+    btn.disabled = false;
+    updateGenBtn(_digestState, false);
+    alert('Failed to start preparation: ' + e.message);
   }
 }
 
@@ -1533,7 +1605,10 @@ async function cancelPrep() {
   loadLatest();
 }
 
-async function publishEp(date) {
+async function publishEp(date, hasExisting) {
+  if (hasExisting) {
+    if (!confirm('There is already a published episode for today. Publishing will replace it in the RSS feed and History. Continue?')) return;
+  }
   const btn = event.target;
   btn.disabled = true; btn.textContent = 'Publishing...';
   const form = new FormData(); form.append('date', date);
@@ -1577,9 +1652,11 @@ async function updateHealth() {
     const h = await (await fetch('/health')).json();
     const btn = document.getElementById('gen-btn');
     const info = document.getElementById('sched-info');
-    if (_prepActive && h.generation_running) { btn.disabled=true; btn.textContent='Preparing...'; }
-    else if (_prepActive) { updateGenBtn(null, true); }
-    else if (_digestState !== undefined) { updateGenBtn(_digestState, false); }
+    if (!btn.disabled) {
+      if (_prepActive && h.generation_running) { btn.disabled=true; btn.textContent='Preparing...'; }
+      else if (_prepActive) { updateGenBtn(null, true); }
+      else if (_digestState !== null) { updateGenBtn(_digestState, false); }
+    }
     if (h.next_scheduled_run) {
       const next = new Date(h.next_scheduled_run);
       info.textContent = 'Next: ' + next.toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
