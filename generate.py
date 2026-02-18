@@ -79,6 +79,14 @@ async def generate_digest_only() -> CompiledDigest | None:
         try:
             compiled = digest_compiler.compile(digest)
 
+            # Check if this date's digest is locked (episode already uploaded)
+            if database.has_episode(compiled.date):
+                msg = f"Digest for {compiled.date} is locked (episode exists) — skipping save"
+                logger.info(msg)
+                database.log_step(run_id, "3. Compile digest", "skipped", msg)
+                database.finish_run(run_id, "success")
+                return compiled
+
             database.save_digest(
                 date=compiled.date,
                 markdown_text=compiled.text,

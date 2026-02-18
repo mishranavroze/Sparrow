@@ -88,11 +88,30 @@ def _create_tables(conn: sqlite3.Connection) -> None:
 
 # --- Digest CRUD ---
 
+def has_episode(date: str) -> bool:
+    """Check if an episode exists for the given date."""
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM episodes WHERE date = ?", (date,)
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
 def save_digest(date: str, markdown_text: str, article_count: int,
                 total_words: int, topics_summary: str, rss_summary: str = "",
                 segment_counts: dict[str, int] | None = None,
                 segment_sources: dict[str, list[str]] | None = None) -> None:
-    """Save or update a daily digest."""
+    """Save or update a daily digest.
+
+    Refuses to overwrite if an episode already exists for this date (locked).
+    """
+    if has_episode(date):
+        logger.warning("Digest for %s is locked (episode exists) — skipping overwrite.", date)
+        return
+
     conn = _get_connection()
     try:
         conn.execute(

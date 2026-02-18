@@ -84,6 +84,33 @@ def test_delete_digests_between(tmp_path):
         assert database.get_digest("2099-06-04") is None
 
 
+def test_save_digest_locked_by_episode(tmp_path):
+    """save_digest refuses to overwrite when an episode exists for that date."""
+    db_path = tmp_path / "test.db"
+    with patch.object(database, "DB_PATH", db_path):
+        # Save initial digest
+        database.save_digest("2099-06-02", "Original content", 5, 500, "Topics A")
+
+        # Save an episode for the same date (locks the digest)
+        database.save_episode("2099-06-02", 5000000, 1200, "00:20:00", "Topics A")
+
+        # Try to overwrite — should be silently refused
+        database.save_digest("2099-06-02", "New content", 10, 1000, "Topics B")
+
+        # Original content should be preserved
+        result = database.get_digest("2099-06-02")
+        assert result["markdown_text"] == "Original content"
+        assert result["article_count"] == 5
+
+
+def test_has_episode(tmp_path):
+    db_path = tmp_path / "test.db"
+    with patch.object(database, "DB_PATH", db_path):
+        assert database.has_episode("2099-06-02") is False
+        database.save_episode("2099-06-02", 5000000, 1200, "00:20:00", "Topics")
+        assert database.has_episode("2099-06-02") is True
+
+
 def test_delete_digests_between_empty(tmp_path):
     db_path = tmp_path / "test.db"
     with patch.object(database, "DB_PATH", db_path):

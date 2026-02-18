@@ -276,6 +276,7 @@ async def api_latest_episode():
     if all_digests:
         latest_digest = database.get_digest(all_digests[0]["date"])
         if latest_digest:
+            has_ep = database.has_episode(latest_digest["date"])
             digest_meta = {
                 "date": latest_digest["date"],
                 "article_count": latest_digest["article_count"],
@@ -283,6 +284,7 @@ async def api_latest_episode():
                 "total_chars": len(latest_digest["markdown_text"]),
                 "topics_summary": latest_digest["topics_summary"],
                 "download_url": f"/digests/{latest_digest['date']}.md",
+                "locked": has_ep,
             }
 
     return JSONResponse({
@@ -581,13 +583,34 @@ async def episode(filename: str, request: Request) -> Response:
 
 
 @app.post("/api/generate")
-async def api_generate():
-    """Manually trigger digest preparation (steps 1-3)."""
+async def api_generate(force: bool = Query(False)):
+    """Manually trigger digest preparation (steps 1-3).
+
+    Args:
+        force: If True, discard existing unlocked digest and re-prepare.
+    """
     if _generation_lock.locked():
         return JSONResponse(
             {"status": "already_running", "message": "Digest preparation is already in progress."},
             status_code=409,
         )
+
+    today_str = datetime.now(UTC).strftime("%Y-%m-%d")
+
+    # Hard lock: if an episode exists for today, never allow re-generation
+    if database.has_episode(today_str):
+        return JSONResponse(
+            {"status": "locked", "message": f"Digest for {today_str} is locked (episode uploaded)."},
+            status_code=409,
+        )
+
+    # Soft lock: digest exists but no episode yet — require force to re-prepare
+    if not force and database.get_digest(today_str) is not None:
+        return JSONResponse(
+            {"status": "digest_exists", "message": f"Digest for {today_str} already prepared. Upload audio or use force to re-prepare."},
+            status_code=409,
+        )
+
     asyncio.create_task(_run_generation())
     return JSONResponse({"status": "started", "message": "Digest preparation started."})
 
@@ -610,6 +633,18 @@ async def api_cron_generate(secret: str = Query("")):
     if _generation_lock.locked():
         return JSONResponse(
             {"status": "already_running", "message": "Digest preparation is already in progress."},
+            status_code=409,
+        )
+
+    today_str = datetime.now(UTC).strftime("%Y-%m-%d")
+    if database.has_episode(today_str):
+        return JSONResponse(
+            {"status": "locked", "message": f"Digest for {today_str} is locked (episode uploaded)."},
+            status_code=409,
+        )
+    if database.get_digest(today_str) is not None:
+        return JSONResponse(
+            {"status": "digest_exists", "message": f"Digest for {today_str} already prepared."},
             status_code=409,
         )
 
@@ -922,7 +957,7 @@ DASHBOARD_HTML = """\
   </div>
   <div class="actions">
     <span style="font-size:10px;color:var(--text-dim);" id="sched-info"></span>
-    <button class="btn" id="gen-btn" onclick="triggerGen()">Prepare Digest</button>
+    <button class="btn" id="gen-btn">Prepare Digest</button>
     <a class="btn" href="/feed.xml">RSS Feed</a>
   </div>
 </header>
@@ -973,10 +1008,19 @@ async function loadLatest() {
   if (!data.episode && !data.digest) {
     left.innerHTML = '<div class="empty"><div class="owl">&#x1F989;</div><p>No episodes yet.<br>Click <strong>Prepare Digest</strong> to fetch today\\'s newsletters, then upload audio from NotebookLM.</p></div>';
     document.getElementById('right-col').innerHTML = '';
+    updateGenBtn(null);
     return;
   }
 
   let h = '';
+
+  if (data.digest) {
+    const d = data.digest;
+    h += '<div class="card"><div class="card-label">Today\\'s Digest</div><div class="digest-row"><div>';
+    h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + d.total_words.toLocaleString() + ' words &middot; ' + d.total_chars.toLocaleString() + ' chars</div>';
+    h += '<div class="digest-topics">' + esc(d.topics_summary||'') + '</div>';
+    h += '</div><a class="dl-btn" href="' + d.download_url + '" download>Download .md</a></div></div>';
+  }
 
   if (data.episode) {
     const ep = data.episode;
@@ -990,42 +1034,33 @@ async function loadLatest() {
     h += '<audio controls preload="metadata" src="' + ep.audio_url + '"></audio></div>';
   }
 
-  if (data.digest) {
-    const d = data.digest;
-    h += '<div class="card"><div class="card-label">Today\\'s Digest</div><div class="digest-row"><div>';
-    h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + d.total_words.toLocaleString() + ' words &middot; ' + d.total_chars.toLocaleString() + ' chars</div>';
-    h += '<div class="digest-topics">' + esc(d.topics_summary||'') + '</div>';
-    h += '</div><a class="dl-btn" href="' + d.download_url + '" download>Download .md</a></div></div>';
-
-    h += '<div class="card"><div class="card-label">Upload Episode MP3</div>';
-    h += '<div class="upload-row"><input type="file" id="mp3-file" accept=".mp3,.m4a,.wav,.ogg,.webm,audio/*">';
-    h += '<button class="up-btn" id="up-btn" onclick="uploadEp(\\'' + esc(d.date) + '\\')">Upload</button></div>';
-    h += '<div class="upload-status" id="up-status"></div></div>';
-  }
-
   left.innerHTML = h;
-  loadRadar(radarMode);
+  updateGenBtn(data.digest);
+  loadRadar(radarMode, 'right-col');
 }
 
 // ===== RADAR =====
-async function loadRadar(mode) {
-  radarMode = mode || 'latest';
-  const box = document.getElementById('right-col');
+async function loadRadar(mode, containerId) {
+  containerId = containerId || 'right-col';
+  var canvasId = 'radar-cv-' + containerId;
+  if (containerId === 'right-col') radarMode = mode || 'latest';
+  mode = mode || 'latest';
+  const box = document.getElementById(containerId);
   try {
-    const res = await fetch('/api/topic-coverage?mode=' + radarMode);
+    const res = await fetch('/api/topic-coverage?mode=' + mode);
     const data = await res.json();
     const topics = data.topics;
     if (!topics) { box.innerHTML = ''; return; }
 
     let h = '<div class="radar-card"><div class="radar-hdr"><div class="card-label">Topic Coverage</div>';
     h += '<div class="radar-toggle">';
-    h += '<button class="' + (radarMode==='latest'?'active':'') + '" onclick="loadRadar(\\'latest\\')">Latest</button>';
-    h += '<button class="' + (radarMode==='cumulative'?'active':'') + '" onclick="loadRadar(\\'cumulative\\')">All Time</button>';
+    h += '<button class="' + (mode==='latest'?'active':'') + '" onclick="loadRadar(\\'latest\\',\\'' + containerId + '\\')">Latest</button>';
+    h += '<button class="' + (mode==='cumulative'?'active':'') + '" onclick="loadRadar(\\'cumulative\\',\\'' + containerId + '\\')">All Time</button>';
     h += '</div></div>';
-    h += '<canvas id="radar-cv" width="500" height="500" style="display:block;margin:0 auto;"></canvas>';
+    h += '<canvas id="' + canvasId + '" width="500" height="500" style="display:block;margin:0 auto;"></canvas>';
     h += '<div class="radar-legend"><span><span class="sw" style="background:rgba(196,160,82,0.6);"></span>Target (100%)</span>';
     h += '<span><span class="sw" style="background:rgba(96,165,250,0.6);"></span>Actual</span></div>';
-    const lbl = radarMode==='latest' ? 'latest digest' : data.digests_analyzed + ' digests';
+    const lbl = mode==='latest' ? 'latest digest' : data.digests_analyzed + ' digests';
     h += '<div class="radar-stats">' + lbl + ' &middot; ' + data.total_articles + ' articles' + (!data.has_data?' &middot; no coverage data yet':'') + '</div>';
 
     if (data.suggestions && data.suggestions.length > 0) {
@@ -1051,15 +1086,15 @@ async function loadRadar(mode) {
 
     h += '</div>';
     box.innerHTML = h;
-    drawRadar(topics, data.has_data);
+    drawRadar(topics, data.has_data, canvasId);
   } catch (e) {
     console.error('Radar error', e);
     box.innerHTML = '';
   }
 }
 
-function drawRadar(topics, hasActual) {
-  const cv = document.getElementById('radar-cv');
+function drawRadar(topics, hasActual, canvasId) {
+  const cv = document.getElementById(canvasId || 'radar-cv-right-col');
   if (!cv) return;
   const ctx = cv.getContext('2d');
   const W = cv.width, H = cv.height;
@@ -1164,6 +1199,7 @@ async function loadHistory() {
       h += '</div></div>';
     }
 
+    h += '<div id="hist-radar" style="margin-bottom:24px;max-width:540px;"></div>';
     h += '<table class="htable"><thead><tr><th>Date</th><th>Digest</th><th>Audio</th><th>Digest Details</th><th>Audio Details</th></tr></thead><tbody>';
     for (const r of data.rows) {
       const dt = new Date(r.date+'T00:00:00');
@@ -1200,6 +1236,7 @@ async function loadHistory() {
     }
     h += '</tbody></table>';
     box.innerHTML = h;
+    loadRadar('cumulative', 'hist-radar');
   } catch (e) {
     console.error('History error', e);
     box.innerHTML = '<div class="empty"><p>Failed to load history.</p></div>';
@@ -1207,14 +1244,45 @@ async function loadHistory() {
 }
 
 // ===== ACTIONS =====
-async function triggerGen() {
+let _digestState = null; // tracks current digest state for button logic
+
+function updateGenBtn(digest) {
+  _digestState = digest;
+  const btn = document.getElementById('gen-btn');
+  if (!btn) return;
+  if (digest && digest.locked) {
+    // Episode uploaded — locked, show re-prepare for next cycle
+    btn.textContent = 'Prepare New Digest';
+    btn.disabled = false;
+    btn.onclick = () => triggerGen(true);
+  } else if (digest) {
+    // Digest exists, no episode — show discard option
+    btn.textContent = 'Discard & Re-prepare';
+    btn.disabled = false;
+    btn.onclick = () => triggerGen(true);
+  } else {
+    btn.textContent = 'Prepare Digest';
+    btn.disabled = false;
+    btn.onclick = () => triggerGen(false);
+  }
+}
+
+async function triggerGen(force) {
   const btn = document.getElementById('gen-btn');
   btn.disabled = true; btn.textContent = 'Preparing...';
-  try { await fetch('/api/generate',{method:'POST'}); } catch(e) {}
+  const url = '/api/generate' + (force ? '?force=true' : '');
+  try {
+    const res = await fetch(url, {method:'POST'});
+    const data = await res.json();
+    if (!res.ok && data.status === 'locked') {
+      btn.disabled = false; btn.textContent = 'Prepare New Digest';
+      return;
+    }
+  } catch(e) {}
   const poll = setInterval(async () => {
     try {
       const h = await (await fetch('/health')).json();
-      if (!h.generation_running) { clearInterval(poll); btn.disabled=false; btn.textContent='Prepare Digest'; loadLatest(); }
+      if (!h.generation_running) { clearInterval(poll); loadLatest(); }
     } catch(e) {}
   }, 5000);
 }
@@ -1245,7 +1313,7 @@ async function updateHealth() {
     const btn = document.getElementById('gen-btn');
     const info = document.getElementById('sched-info');
     if (h.generation_running) { btn.disabled=true; btn.textContent='Preparing...'; }
-    else { btn.disabled=false; btn.textContent='Prepare Digest'; }
+    else if (_digestState !== undefined) { updateGenBtn(_digestState); }
     if (h.next_scheduled_run) {
       const next = new Date(h.next_scheduled_run);
       info.textContent = 'Next: ' + next.toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
