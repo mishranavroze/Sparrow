@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI, Form, Request, Response, UploadFile
+from fastapi import FastAPI, Form, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -40,6 +40,19 @@ def _calc_next_run() -> datetime:
     return target
 
 
+def _today_digest_exists() -> bool:
+    """Check if a digest for today's UTC date already exists."""
+    today_str = datetime.now(UTC).strftime("%Y-%m-%d")
+    return database.get_digest(today_str) is not None
+
+
+def _missed_todays_run() -> bool:
+    """Return True if the scheduled time already passed today and no digest exists yet."""
+    now = datetime.now(UTC)
+    target = now.replace(hour=settings.generation_hour, minute=settings.generation_minute, second=0, microsecond=0)
+    return now > target and not _today_digest_exists()
+
+
 async def _run_generation() -> None:
     """Run digest preparation (steps 1-3), guarded by a lock."""
     global _generation_running
@@ -60,7 +73,7 @@ async def _run_generation() -> None:
 
 
 async def _scheduler() -> None:
-    """Background task that triggers generation at the configured hour daily."""
+    """Background fallback scheduler (in case external cron misses)."""
     global _next_scheduled_run
     while True:
         _next_scheduled_run = _calc_next_run()
@@ -77,7 +90,12 @@ async def _scheduler() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start the background scheduler when the app starts."""
+    """Start the background scheduler and check for missed runs on startup."""
+    # Check if we missed today's run (e.g. autoscale spun down during scheduled time)
+    if _missed_todays_run():
+        logger.info("Startup: missed today's scheduled run — triggering now.")
+        asyncio.create_task(_run_generation())
+
     task = asyncio.create_task(_scheduler())
     logger.info("Background scheduler started (%02d:%02d UTC).", settings.generation_hour, settings.generation_minute)
     yield
@@ -254,6 +272,32 @@ async def api_generate():
         )
     asyncio.create_task(_run_generation())
     return JSONResponse({"status": "started", "message": "Digest preparation started."})
+
+
+@app.get("/api/cron/generate")
+async def api_cron_generate(secret: str = Query("")):
+    """External cron trigger for daily digest generation.
+
+    Call this from an external cron service (e.g. cron-job.org) at 07:30 UTC.
+    Requires the CRON_SECRET query parameter for authentication.
+    """
+    if not settings.cron_secret:
+        return JSONResponse(
+            {"error": "CRON_SECRET not configured on server."},
+            status_code=500,
+        )
+    if secret != settings.cron_secret:
+        return JSONResponse({"error": "Invalid secret."}, status_code=403)
+
+    if _generation_lock.locked():
+        return JSONResponse(
+            {"status": "already_running", "message": "Digest preparation is already in progress."},
+            status_code=409,
+        )
+
+    logger.info("Cron trigger: starting digest generation.")
+    asyncio.create_task(_run_generation())
+    return JSONResponse({"status": "started", "message": "Digest preparation started via cron."})
 
 
 @app.post("/api/upload-episode")

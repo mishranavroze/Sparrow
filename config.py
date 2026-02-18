@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     generation_hour: int = 7
     generation_minute: int = 30
 
+    # Secret for external cron trigger (e.g. cron-job.org)
+    cron_secret: str = ""
+
     # Serving
     base_url: str = "http://localhost:8000"
     podcast_title: str = "The Hootline"
