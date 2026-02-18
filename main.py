@@ -400,6 +400,7 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
     return JSONResponse({
         "status": "ok",
         "message": f"Episode for {date} published.",
+        "feed_url": f"{settings.base_url}/feed.xml",
         "episode": {
             "date": metadata.date,
             "duration_formatted": metadata.duration_formatted,
@@ -745,6 +746,11 @@ DASHBOARD_HTML = """\
           <audio controls preload="metadata" src="${ep.audio_url}">
             Your browser does not support the audio element.
           </audio>
+          <div style="margin-top:12px;font-size:13px;">
+            <a href="/feed.xml" style="color:var(--accent);text-decoration:none;">RSS Feed</a>
+            <span style="color:var(--muted);margin:0 8px;">&middot;</span>
+            <span style="color:var(--muted);">Add this link to Spotify or your podcast app</span>
+          </div>
         </div>`;
     }
 
@@ -828,8 +834,9 @@ DASHBOARD_HTML = """\
       const data = await res.json();
       if (res.ok) {
         status.className = 'upload-status success';
-        status.textContent = data.message;
-        setTimeout(() => load(), 1500);
+        const feedUrl = data.feed_url || '/feed.xml';
+        status.innerHTML = data.message + ' <a href="' + feedUrl + '" style="color:var(--accent);text-decoration:underline;">View RSS Feed</a>';
+        setTimeout(() => load(), 3000);
       } else {
         status.className = 'upload-status error';
         status.textContent = data.error || 'Upload failed.';
