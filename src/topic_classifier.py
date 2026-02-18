@@ -63,9 +63,12 @@ FILTERED_SENDERS: set[str] = {
     "google",
     "google one",
     "google play",
+    "google gemini",
+    "gmail team",
     "notebooklm",
     "noreply",
     "no-reply",
+    "substack",
 }
 
 # Single-topic newsletter sources — map sender name (lowercased) to topic
@@ -92,6 +95,9 @@ SOURCE_TOPIC_MAP: dict[str, Topic] = {
     "the hindu": Topic.INDIAN_POLITICS,
     "the indian express": Topic.INDIAN_POLITICS,
     "mint": Topic.INDIAN_POLITICS,
+    "the chai brief": Topic.INDIAN_POLITICS,
+    "chai brief": Topic.INDIAN_POLITICS,
+    "peter steinberger": Topic.TECH_AI,
     "interesting facts": Topic.OTHER,
     "better report": Topic.OTHER,
 }
@@ -192,10 +198,15 @@ TOPIC_KEYWORDS: dict[Topic, list[str]] = {
 }
 
 
+def _normalize(text: str) -> str:
+    """Normalize text for matching: lowercase, strip, and replace curly quotes."""
+    return text.lower().strip().replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
+
+
 def _is_filtered_sender(sender: str) -> bool:
     """Check if an email sender should be filtered out."""
-    sender_lower = sender.lower().strip()
-    return sender_lower in FILTERED_SENDERS
+    sender_norm = _normalize(sender)
+    return sender_norm in FILTERED_SENDERS
 
 
 def _score_keywords(text: str, topic: Topic) -> int:
@@ -223,7 +234,7 @@ def classify_article(article: Article) -> Topic | None:
         return None
 
     # Check source-based mapping first
-    source_lower = article.source.lower().strip()
+    source_lower = _normalize(article.source)
     for source_key, topic in SOURCE_TOPIC_MAP.items():
         if source_key in source_lower or source_lower in source_key:
             logger.debug("Source map: '%s' -> %s", article.source, topic)
