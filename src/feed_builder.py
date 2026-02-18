@@ -68,7 +68,13 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
     # Add episodes (most recent first)
     for ep in sorted(episodes, key=lambda e: e["date"], reverse=True)[:MAX_FEED_EPISODES]:
         fe = fg.add_entry()
-        fe.id(f"{settings.base_url}/episodes/noctua-{ep['date']}.mp3")
+        # Use revision suffix in GUID/URL to force podcast platforms to
+        # re-download when an episode file is replaced.
+        revision = ep.get("revision", 1)
+        rev_suffix = f"?v={revision}" if revision > 1 else ""
+        mp3_url = f"{settings.base_url}/episodes/noctua-{ep['date']}.mp3{rev_suffix}"
+
+        fe.id(mp3_url)
 
         # Format title as the date, e.g. "February 17, 2026"
         try:
@@ -85,7 +91,6 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
         )
 
         # Enclosure (the MP3 file)
-        mp3_url = f"{settings.base_url}/episodes/noctua-{ep['date']}.mp3"
         fe.enclosure(mp3_url, str(ep["file_size_bytes"]), "audio/mpeg")
 
         # Podcast extensions
