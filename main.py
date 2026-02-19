@@ -1249,6 +1249,27 @@ function esc(s) {
 // ===== LATEST TAB =====
 let _prepActive = false;
 
+function segmentCard() {
+  const segs = [
+    ['Latest in Tech', 5], ['Product Management', 4], ['World Politics', 4],
+    ['US Politics', 3], ['Indian Politics', 3], ['Entertainment', 3],
+    ['CrossFit', 2], ['F1', 2], ['Arsenal', 1], ['Indian Cricket', 1],
+    ['Badminton', 1], ['Sports', 1], ['Seattle', 1], ['Other', 1],
+  ];
+  let s = '<div class="card"><div class="card-label">Segment Allocation</div>';
+  s += '<div style="display:grid;grid-template-columns:1fr auto;gap:2px 12px;font-size:11px;margin-top:6px;">';
+  let total = 0;
+  for (const [name, mins] of segs) {
+    total += mins;
+    s += '<span style="color:var(--text);">' + name + '</span>';
+    s += '<span style="color:var(--text-dim);text-align:right;">~' + mins + ' min</span>';
+  }
+  s += '<span style="color:var(--gold);font-weight:600;border-top:1px solid var(--border);padding-top:4px;margin-top:4px;">Total</span>';
+  s += '<span style="color:var(--gold);font-weight:600;text-align:right;border-top:1px solid var(--border);padding-top:4px;margin-top:4px;">~' + total + ' min</span>';
+  s += '</div></div>';
+  return s;
+}
+
 async function loadLatest() {
   let res, data;
   try {
@@ -1301,6 +1322,7 @@ async function loadLatest() {
     h += '<audio controls preload="metadata" src="' + ep.audio_url + '"></audio></div>';
   }
 
+  h += segmentCard();
   left.innerHTML = h;
   updateGenBtn(data.digest, false);
   loadRadar(radarMode, 'right-col');
@@ -1365,6 +1387,7 @@ function renderPreparation(prep) {
     h += '</div></div>';
   }
 
+  h += segmentCard();
   left.innerHTML = h;
 }
 
