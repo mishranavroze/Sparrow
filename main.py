@@ -262,6 +262,10 @@ async def _scheduler() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start the background scheduler and check for missed runs on startup."""
+    # Ensure output directories exist
+    EPISODES_DIR.mkdir(parents=True, exist_ok=True)
+    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
     # Sync RSS feed from database (source of truth) on every startup
     feed_builder.sync_catalog_from_db()
 
@@ -1041,7 +1045,18 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
 
 @app.get("/health")
 async def health() -> dict:
-    """Health check endpoint."""
+    """Health check endpoint — kept lightweight for fast deployment health checks."""
+    return {
+        "status": "ok",
+        "generation_running": _generation_running,
+        "next_scheduled_run": _next_scheduled_run.isoformat() if _next_scheduled_run else None,
+        "generation_schedule_utc": f"{settings.generation_hour:02d}:{settings.generation_minute:02d}",
+    }
+
+
+@app.get("/health/detail")
+async def health_detail() -> dict:
+    """Detailed health check with file system and database stats."""
     episode_count = len(list(EPISODES_DIR.glob("noctua-*.mp3"))) if EPISODES_DIR.exists() else 0
     feed_exists = FEED_PATH.exists()
     digest_count = len(database.list_digests())
