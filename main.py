@@ -382,7 +382,10 @@ async def api_episodes():
 
 
 @app.get("/api/topic-coverage")
-async def api_topic_coverage(mode: str = Query("cumulative")):
+async def api_topic_coverage(
+    mode: str = Query("cumulative"),
+    published_only: bool = Query(False),
+):
     """Radar chart data: target vs actual topic coverage with suggestions.
 
     Each topic's target is 100% (its full allocated time). Actual is the
@@ -390,6 +393,7 @@ async def api_topic_coverage(mode: str = Query("cumulative")):
 
     Args:
         mode: "cumulative" for all digests, "latest" for most recent only.
+        published_only: If True, only include digests with published episodes.
     """
     from src.topic_classifier import SEGMENT_DURATIONS, SEGMENT_ORDER
 
@@ -401,17 +405,24 @@ async def api_topic_coverage(mode: str = Query("cumulative")):
     total_minutes = sum(duration_map.values())
 
     # Actual coverage from recent digests
-    # When preparation is active and mode=latest, use the in-memory digest
-    # so the radar reflects the new digest, not the old published one.
-    if mode == "latest" and _preparation_active and _preparation_digest:
-        digests = [{
+    # When preparation is active, use the in-memory digest:
+    #   - mode=latest: show only the new digest
+    #   - mode=cumulative: include the new digest alongside DB digests
+    prep_digest_data = None
+    if _preparation_active and _preparation_digest and not published_only:
+        prep_digest_data = {
             "date": _preparation_digest.date,
             "segment_counts": _preparation_digest.segment_counts or {},
             "segment_sources": _preparation_digest.segment_sources or {},
-        }]
+        }
+
+    if mode == "latest" and prep_digest_data:
+        digests = [prep_digest_data]
     else:
         limit = 1 if mode == "latest" else 30
-        digests = database.get_topic_coverage(limit=limit)
+        digests = database.get_topic_coverage(limit=limit, published_only=published_only)
+        if mode == "cumulative" and prep_digest_data:
+            digests = [prep_digest_data] + digests
 
     totals: dict[str, int] = {}
     all_sources: dict[str, set[str]] = {}
@@ -1365,7 +1376,9 @@ async function loadRadar(mode, containerId) {
   mode = mode || 'latest';
   const box = document.getElementById(containerId);
   try {
-    const res = await fetch('/api/topic-coverage?mode=' + mode);
+    let tcUrl = '/api/topic-coverage?mode=' + mode;
+    if (containerId === 'hist-radar') tcUrl += '&published_only=true';
+    const res = await fetch(tcUrl);
     const data = await res.json();
     const topics = data.topics;
     if (!topics) { box.innerHTML = ''; return; }

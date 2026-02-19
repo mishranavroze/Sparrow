@@ -210,14 +210,27 @@ def delete_digests_between(start: str, end: str) -> int:
         conn.close()
 
 
-def get_topic_coverage(limit: int = 30) -> list[dict]:
-    """Get segment_counts and segment_sources from recent digests for topic coverage analysis."""
+def get_topic_coverage(limit: int = 30, published_only: bool = False) -> list[dict]:
+    """Get segment_counts and segment_sources from recent digests for topic coverage analysis.
+
+    Args:
+        limit: Max number of digests to return.
+        published_only: If True, only return digests that have a published episode.
+    """
     conn = _get_connection()
     try:
-        rows = conn.execute(
-            "SELECT date, segment_counts, segment_sources FROM digests ORDER BY date DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        if published_only:
+            rows = conn.execute(
+                "SELECT d.date, d.segment_counts, d.segment_sources "
+                "FROM digests d INNER JOIN episodes e ON d.date = e.date "
+                "ORDER BY d.date DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT date, segment_counts, segment_sources FROM digests ORDER BY date DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         result = []
         for r in rows:
             d = dict(r)
