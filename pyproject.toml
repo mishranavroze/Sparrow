@@ -19,6 +19,7 @@ dependencies = [
     "mutagen>=1.47.0",
     "python-multipart>=0.0.22",
     "google-cloud-storage>=2.18.0",
+    "imageio-ffmpeg>=0.5.0",
 ]
 
 [project.optional-dependencies]

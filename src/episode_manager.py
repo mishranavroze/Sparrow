@@ -16,8 +16,16 @@ logger = logging.getLogger(__name__)
 
 EPISODES_DIR = Path("output/episodes")
 
-# Resolve ffmpeg path at import time (nix PATH may not be available at runtime)
-FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
+def _ffmpeg_path() -> str:
+    """Resolve ffmpeg: system PATH first, then bundled imageio-ffmpeg fallback."""
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:
+        return "ffmpeg"
 
 
 def _is_mp3(path: Path) -> bool:
@@ -39,7 +47,7 @@ def _convert_to_mp3(path: Path) -> Path:
     """Convert a non-MP3 audio file to MP3 using ffmpeg."""
     tmp_output = path.with_suffix(".tmp.mp3")
     cmd = [
-        FFMPEG, "-i", str(path),
+        _ffmpeg_path(), "-i", str(path),
         "-codec:a", "libmp3lame", "-qscale:a", "2",
         "-y", str(tmp_output),
     ]

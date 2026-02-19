@@ -21,8 +21,15 @@ from src import database, episode_manager, feed_builder
 
 ACCEPTED_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".webm"}
 def _ffmpeg_path() -> str:
-    """Resolve ffmpeg at call time (PATH may not be ready at import)."""
-    return shutil.which("ffmpeg") or "ffmpeg"
+    """Resolve ffmpeg: system PATH first, then bundled imageio-ffmpeg fallback."""
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:
+        return "ffmpeg"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
