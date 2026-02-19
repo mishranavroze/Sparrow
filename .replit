@@ -38,7 +38,7 @@ outputType = "webview"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "fuser -k 5000/tcp 2>/dev/null; sleep 1; python -m uvicorn main:app --host 0.0.0.0 --port 5000"
+args = "bash start.sh"
 
 [[workflows.workflow]]
 name = "Run tests"
