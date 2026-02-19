@@ -960,18 +960,27 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
     # Convert to MP3 if needed
     if ext != ".mp3":
         try:
+            logger.info("Converting %s (%d bytes) to MP3...", upload_path.name, upload_path.stat().st_size)
             result = subprocess.run(
                 ["ffmpeg", "-i", str(upload_path), "-codec:a", "libmp3lame", "-qscale:a", "2", "-y", str(mp3_path)],
-                capture_output=True, text=True,
+                capture_output=True, text=True, timeout=300,
             )
             upload_path.unlink(missing_ok=True)
             if result.returncode != 0:
+                logger.error("ffmpeg failed (exit %d): %s", result.returncode, result.stderr[:500])
                 mp3_path.unlink(missing_ok=True)
                 return JSONResponse(
                     {"error": f"Audio conversion failed: {result.stderr[:300]}"},
                     status_code=422,
                 )
-            logger.info("Converted %s to MP3", ext)
+            logger.info("Converted %s to MP3 (%d bytes)", ext, mp3_path.stat().st_size)
+        except subprocess.TimeoutExpired:
+            upload_path.unlink(missing_ok=True)
+            mp3_path.unlink(missing_ok=True)
+            return JSONResponse(
+                {"error": "Audio conversion timed out (file may be too large)."},
+                status_code=422,
+            )
         except FileNotFoundError:
             upload_path.unlink(missing_ok=True)
             return JSONResponse(
@@ -989,6 +998,7 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
         duration_formatted = _format_duration(duration_seconds)
         file_size_bytes = mp3_path.stat().st_size
     except Exception as e:
+        logger.error("Audio validation failed for %s: %s", mp3_path.name, e)
         mp3_path.unlink(missing_ok=True)
         return JSONResponse(
             {"error": f"Audio validation failed: {e}"},
