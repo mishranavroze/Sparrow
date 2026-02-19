@@ -1260,7 +1260,7 @@ function segmentCard() {
   // Intro
   s += '<div style="font-size:11px;color:var(--text-dim);margin-top:6px;padding:6px 8px;background:rgba(255,255,255,0.03);border-radius:4px;">';
   s += '<span style="color:var(--gold);font-weight:600;">Intro (~1 min)</span><br>';
-  s += 'Welcome to The Hootline, your daily knowledge briefing. Here\\'s a quick look at what we\\'re covering today: [topics]. Let\\'s dive in.';
+  s += 'Welcome to The Hootline, your daily knowledge briefing. Let\\'s dive in.';
   s += '</div>';
   // Segments
   s += '<div style="display:grid;grid-template-columns:1fr auto;gap:2px 12px;font-size:11px;margin-top:8px;">';

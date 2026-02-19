@@ -31,8 +31,7 @@ This document is organized into numbered segments. When generating the podcast:
 
 INTRO_SECTION = """\
 ## INTRO (~1 minute)
-Welcome to The Hootline, your daily knowledge briefing. Here's a quick look at \
-what we're covering today: {topics_preview}. Let's dive in.
+Welcome to The Hootline, your daily knowledge briefing. Let's dive in.
 """
 
 OUTRO_SECTION = """\
@@ -193,10 +192,8 @@ def _compile_text(
     for topic in SEGMENT_ORDER:
         ordered_articles.extend(grouped.get(topic.value, []))
 
-    # Build topics preview for intro
     active_topics = [t.value for t in SEGMENT_ORDER if grouped.get(t.value)]
-    topics_preview = ", ".join(active_topics[:-1]) + f", and {active_topics[-1]}" if len(active_topics) > 1 else active_topics[0] if active_topics else ""
-    intro = INTRO_SECTION.format(topics_preview=topics_preview)
+    intro = INTRO_SECTION
     outro = OUTRO_SECTION
 
     preamble = f"# The Hootline — Daily Briefing — {date_str}\n\n\n{PODCAST_PREAMBLE}"
