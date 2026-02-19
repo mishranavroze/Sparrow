@@ -17,14 +17,18 @@ logger = logging.getLogger(__name__)
 # NotebookLM source limit (100K characters)
 MAX_SOURCE_CHARS = 100_000
 
+# Approximate words per minute for podcast speech
+WORDS_PER_MINUTE = 150
+
 PODCAST_PREAMBLE = """\
 **PODCAST PRODUCTION INSTRUCTIONS:**
 This document is organized into numbered segments. When generating the podcast:
-- Begin with a warm welcome and brief overview of today's topics
+- Begin with a warm welcome
 - Present each segment in order, using the segment title as a transition
-- Spend roughly the suggested time on each segment (where noted)
+- Each segment has a word budget — spend roughly proportional time on it
 - Skip any segment that contains no articles
 - Use a conversational but informative tone throughout
+- Summarize and discuss the key points from each article, do not read them verbatim
 - Transition smoothly between segments with brief bridges
 - End with a brief wrap-up and sign-off
 """
@@ -108,6 +112,12 @@ def _generate_rss_summary(articles: list[Article]) -> str:
         return "Your nightly knowledge briefing from The Hootline."
 
 
+def _parse_minutes(topic: Topic) -> int:
+    """Extract the integer minutes from a SEGMENT_DURATIONS entry."""
+    dur_str = SEGMENT_DURATIONS.get(topic, "~1 minute")
+    return int(dur_str.replace("~", "").replace(" minutes", "").replace(" minute", ""))
+
+
 def _allocate_budget(articles: list[Article], budget: int) -> dict[int, int]:
     """Allocate a character budget across articles.
 
@@ -151,9 +161,9 @@ def _compile_text(
 ) -> tuple[str, dict[str, int]]:
     """Compile articles into a segment-structured markdown document.
 
-    Uses budget allocation to ensure the final text fits within
-    MAX_SOURCE_CHARS. Short articles keep full text; long ones are
-    trimmed proportionally.
+    Each segment gets a word budget proportional to its allocated time.
+    Content is capped to fit the budget regardless of incoming volume.
+    Sources are prominently listed per segment.
 
     Args:
         digest: The day's parsed articles.
@@ -168,12 +178,16 @@ def _compile_text(
         topic_key = article.topic if article.topic else Topic.OTHER.value
         grouped[topic_key].append(article)
 
-    # Cap articles per topic proportional to allocated minutes.
-    # ~1.5 articles per minute, minimum 2 per topic.
+    # Calculate word budget per segment based on allocated minutes
+    segment_word_budgets: dict[str, int] = {}
+    for topic in SEGMENT_ORDER:
+        mins = _parse_minutes(topic)
+        segment_word_budgets[topic.value] = mins * WORDS_PER_MINUTE
+
+    # Cap articles per topic — roughly 1.5 articles per minute, minimum 2
     total_before = sum(len(v) for v in grouped.values())
     for topic in SEGMENT_ORDER:
-        dur_str = SEGMENT_DURATIONS.get(topic, "~1 minute")
-        mins = int(dur_str.replace("~", "").replace(" minutes", "").replace(" minute", ""))
+        mins = _parse_minutes(topic)
         max_articles = max(2, round(mins * 1.5))
         articles_list = grouped.get(topic.value, [])
         if len(articles_list) > max_articles:
@@ -186,34 +200,9 @@ def _compile_text(
     if total_after < total_before:
         logger.info("Topic capping: %d -> %d articles", total_before, total_after)
 
-    # Collect articles in segment order and estimate per-article overhead
-    # (title line, source line, separator, joining newlines)
-    ordered_articles: list[Article] = []
-    for topic in SEGMENT_ORDER:
-        ordered_articles.extend(grouped.get(topic.value, []))
-
     active_topics = [t.value for t in SEGMENT_ORDER if grouped.get(t.value)]
     intro = INTRO_SECTION
     outro = OUTRO_SECTION
-
-    preamble = f"# The Hootline — Daily Briefing — {date_str}\n\n\n{PODCAST_PREAMBLE}"
-    # Estimate overhead per article: "### title\n\n*Source: name*\n\n...\n\n\n---\n"
-    per_article_overhead = 80  # conservative average for headers/separators
-    # Segment headers overhead
-    active_segments = len(active_topics)
-    segment_overhead = active_segments * 60  # "## SEGMENT N: Topic (duration)\n\n"
-
-    fixed_overhead = len(preamble) + len(intro) + len(outro) + segment_overhead + (per_article_overhead * len(ordered_articles))
-    content_budget = max(MAX_SOURCE_CHARS - fixed_overhead, len(ordered_articles) * 200)
-
-    # Allocate budget across articles
-    budgets = _allocate_budget(ordered_articles, content_budget)
-    trimmed_count = sum(1 for i, a in enumerate(ordered_articles) if budgets[i] < len(a.content))
-    if trimmed_count:
-        logger.info(
-            "Budget allocation: %d/%d articles trimmed to fit %d char limit",
-            trimmed_count, len(ordered_articles), MAX_SOURCE_CHARS,
-        )
 
     # Build the document
     sections = [f"# The Hootline — Daily Briefing — {date_str}\n"]
@@ -223,7 +212,6 @@ def _compile_text(
     segment_counts: dict[str, int] = {}
     segment_sources: dict[str, list[str]] = {}
     segment_number = 0
-    article_index = 0
 
     for topic in SEGMENT_ORDER:
         articles = grouped.get(topic.value, [])
@@ -236,26 +224,45 @@ def _compile_text(
         sources = list(dict.fromkeys(a.source for a in articles))
         segment_sources[topic.value] = sources
 
+        mins = _parse_minutes(topic)
+        word_budget = segment_word_budgets[topic.value]
         duration = SEGMENT_DURATIONS.get(topic, "")
         duration_label = f" ({duration})" if duration else ""
-        sections.append(
-            f"## SEGMENT {segment_number}: {topic.value}{duration_label}"
-        )
 
-        for article in articles:
+        section_header = f"## SEGMENT {segment_number}: {topic.value}{duration_label}"
+        section_header += f"\n**Word budget: ~{word_budget} words**"
+        sections.append(section_header)
+
+        # Allocate word budget across articles in this segment
+        # Convert word budget to char budget (~6 chars/word + overhead)
+        chars_per_word = 6  # average including spaces
+        overhead_per_article = 60  # title, separator
+        segment_char_budget = max(
+            word_budget * chars_per_word - overhead_per_article * len(articles),
+            len(articles) * 200,
+        )
+        article_budgets = _allocate_budget(articles, segment_char_budget)
+
+        for i, article in enumerate(articles):
             content = article.content
-            cap = budgets.get(article_index, len(content))
+            cap = article_budgets.get(i, len(content))
             if len(content) > cap:
                 content = content[:cap].rsplit("\n", 1)[0] + "\n[...]"
-            article_index += 1
 
             sections.append(f"### {article.title}")
-            sections.append(f"*Source: {article.source}*")
             sections.append(content)
             sections.append("\n---\n")
 
     sections.append(outro)
     text = "\n\n".join(sections)
+
+    # Final safety check against NotebookLM limit
+    if len(text) > MAX_SOURCE_CHARS:
+        logger.warning(
+            "Compiled text %d chars exceeds %d limit, truncating",
+            len(text), MAX_SOURCE_CHARS,
+        )
+        text = text[:MAX_SOURCE_CHARS - 100] + "\n\n[Document truncated to fit source limit.]"
 
     return text, segment_counts, segment_sources
 

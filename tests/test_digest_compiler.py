@@ -129,15 +129,16 @@ def test_compile_text_segment_counts():
     assert segment_counts[Topic.TECH_AI.value] == 1
 
 
-def test_compile_text_shows_source():
-    """Articles should show *Source: name* format."""
+def test_compile_text_tracks_sources():
+    """Sources should be tracked in segment_sources even though not in body text."""
     articles = [
         _make_article(source="The New York Times", title="Test", topic=Topic.OTHER.value),
     ]
     digest = _make_digest(articles)
-    text, _, _ = _compile_text(digest, "February 17, 2026")
+    text, segment_counts, segment_sources = _compile_text(digest, "February 17, 2026")
 
-    assert "*Source: The New York Times*" in text
+    # Sources not in body text but tracked in segment_sources
+    assert "The New York Times" in segment_sources.get("Misc", [])
 
 
 def test_compile_text_truncates_long_content():
