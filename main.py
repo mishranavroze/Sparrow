@@ -113,8 +113,14 @@ def _missed_todays_run() -> bool:
 
 
 async def _run_generation() -> None:
-    """Run digest preparation (steps 1-3), guarded by a lock."""
-    global _generation_running, _preparation_cancelled, _preparation_digest, _preparation_error
+    """Run digest preparation (steps 1-3), guarded by a lock.
+
+    Always keeps the digest in memory (preparation mode) so the user
+    can review, upload audio, and explicitly publish. This applies to
+    both scheduled runs and manual triggers.
+    """
+    global _generation_running, _preparation_active, _preparation_date
+    global _preparation_cancelled, _preparation_digest, _preparation_error
     from generate import generate_digest_only
 
     if _generation_lock.locked():
@@ -123,37 +129,40 @@ async def _run_generation() -> None:
 
     async with _generation_lock:
         _generation_running = True
+
+        # Always enter preparation mode — digest stays in memory until Publish.
+        if not _preparation_active:
+            _preparation_active = True
+            _preparation_date = datetime.now(PST).strftime("%Y-%m-%d")
+            _preparation_digest = None
+            _preparation_error = None
+
         try:
             await _maybe_monday_cleanup()
 
-            if _preparation_active:
-                # During preparation: suppress DB save, keep digest in memory only
-                # so existing History/RSS data stays untouched until Publish.
-                original_save = database.save_digest
-                database.save_digest = lambda *args, **kwargs: None
-                try:
-                    result = await generate_digest_only()
-                finally:
-                    database.save_digest = original_save
+            # Suppress DB save — keep digest in memory only
+            original_save = database.save_digest
+            database.save_digest = lambda *args, **kwargs: None
+            try:
+                result = await generate_digest_only()
+            finally:
+                database.save_digest = original_save
 
-                if _preparation_cancelled:
-                    _preparation_digest = None
-                    _preparation_error = None
-                    logger.info("Preparation cancelled — discarded in-memory digest")
-                elif result is None:
-                    _preparation_digest = None
-                    _preparation_error = "No newsletters found — nothing to prepare."
-                    logger.info("Preparation returned no digest (no emails/articles)")
-                else:
-                    _preparation_digest = result
-                    _preparation_error = None
-                    logger.info("Preparation digest ready (in-memory only)")
+            if _preparation_cancelled:
+                _preparation_digest = None
+                _preparation_error = None
+                logger.info("Preparation cancelled — discarded in-memory digest")
+            elif result is None:
+                _preparation_digest = None
+                _preparation_error = "No newsletters found — nothing to prepare."
+                logger.info("Preparation returned no digest (no emails/articles)")
             else:
-                await generate_digest_only()
+                _preparation_digest = result
+                _preparation_error = None
+                logger.info("Preparation digest ready (in-memory only)")
         except Exception as e:
             logger.error("Digest preparation failed: %s", e)
-            if _preparation_active:
-                _preparation_error = f"Generation failed: {e}"
+            _preparation_error = f"Generation failed: {e}"
         finally:
             _generation_running = False
             _preparation_cancelled = False
@@ -240,7 +249,10 @@ async def lifespan(app: FastAPI):
     # Monday cleanup check on startup
     await _maybe_monday_cleanup()
 
-    # Check if we missed today's run (e.g. autoscale spun down during scheduled time)
+    # Check if we missed today's run (e.g. autoscale spun down during scheduled time).
+    # This also handles restart recovery: if the digest was in memory and the server
+    # crashed, the digest is lost, so re-generation is triggered and enters
+    # preparation mode automatically.
     if _missed_todays_run():
         logger.info("Startup: missed today's scheduled run — triggering now.")
         asyncio.create_task(_run_generation())
@@ -704,31 +716,11 @@ async def episode(filename: str, request: Request) -> Response:
 
 
 @app.post("/api/generate")
-async def api_generate(force: bool = Query(False)):
-    """Manually trigger digest preparation (steps 1-3).
-
-    Args:
-        force: If True, discard existing unlocked digest and re-prepare.
-    """
+async def api_generate():
+    """Manually trigger digest preparation (steps 1-3)."""
     if _generation_lock.locked():
         return JSONResponse(
             {"status": "already_running", "message": "Digest preparation is already in progress."},
-            status_code=409,
-        )
-
-    today_str = datetime.now(UTC).strftime("%Y-%m-%d")
-
-    # Hard lock: if an episode exists for today, never allow re-generation
-    if database.has_episode(today_str):
-        return JSONResponse(
-            {"status": "locked", "message": f"Digest for {today_str} is locked (episode uploaded)."},
-            status_code=409,
-        )
-
-    # Soft lock: digest exists but no episode yet — require force to re-prepare
-    if not force and database.get_digest(today_str) is not None:
-        return JSONResponse(
-            {"status": "digest_exists", "message": f"Digest for {today_str} already prepared. Upload audio or use force to re-prepare."},
             status_code=409,
         )
 
@@ -757,18 +749,6 @@ async def api_cron_generate(secret: str = Query("")):
             status_code=409,
         )
 
-    today_str = datetime.now(UTC).strftime("%Y-%m-%d")
-    if database.has_episode(today_str):
-        return JSONResponse(
-            {"status": "locked", "message": f"Digest for {today_str} is locked (episode uploaded)."},
-            status_code=409,
-        )
-    if database.get_digest(today_str) is not None:
-        return JSONResponse(
-            {"status": "digest_exists", "message": f"Digest for {today_str} already prepared."},
-            status_code=409,
-        )
-
     logger.info("Cron trigger: starting digest generation.")
     asyncio.create_task(_run_generation())
     return JSONResponse({"status": "started", "message": "Digest preparation started via cron."})
@@ -783,7 +763,7 @@ async def api_start_preparation():
     """
     global _preparation_active, _preparation_date, _preparation_cancelled, _preparation_digest, _preparation_error
 
-    today_str = datetime.now(UTC).strftime("%Y-%m-%d")
+    today_str = datetime.now(PST).strftime("%Y-%m-%d")
 
     _preparation_cancelled = False
     _preparation_active = True
