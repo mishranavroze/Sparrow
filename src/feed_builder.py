@@ -153,6 +153,32 @@ def add_episode(metadata: EpisodeMetadata) -> None:
         raise FeedBuildError(f"Failed to add episode to feed: {e}") from e
 
 
+def sync_catalog_from_db() -> None:
+    """Rebuild episodes.json and feed.xml from the database.
+
+    This ensures the RSS feed matches the database (source of truth)
+    after deploys or manual DB edits.
+    """
+    episodes_db = database.list_episodes()
+    catalog = []
+    for ep in episodes_db:
+        entry = {
+            "date": ep["date"],
+            "file_size_bytes": ep["file_size_bytes"],
+            "duration_seconds": ep["duration_seconds"],
+            "duration_formatted": ep["duration_formatted"],
+            "topics_summary": ep.get("topics_summary", ""),
+            "rss_summary": ep.get("rss_summary", ""),
+            "published": ep.get("published_at", ""),
+        }
+        if ep.get("gcs_url"):
+            entry["gcs_url"] = ep["gcs_url"]
+        catalog.append(entry)
+    _save_episode_catalog(catalog)
+    build_feed()
+    logger.info("Synced episodes.json from DB (%d episodes), feed rebuilt.", len(catalog))
+
+
 def clear_feed() -> None:
     """Remove all episodes from the feed catalog and rebuild an empty feed."""
     _save_episode_catalog([])

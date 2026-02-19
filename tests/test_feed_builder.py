@@ -64,6 +64,7 @@ def test_add_episode_and_build_feed(tmp_path):
     with (
         patch("src.feed_builder.EPISODES_JSON", json_path),
         patch("src.feed_builder.FEED_PATH", feed_path),
+        patch("src.feed_builder.database.save_episode"),
     ):
         metadata = _make_metadata()
         add_episode(metadata)
@@ -86,6 +87,7 @@ def test_add_episode_replaces_same_date(tmp_path):
     with (
         patch("src.feed_builder.EPISODES_JSON", json_path),
         patch("src.feed_builder.FEED_PATH", feed_path),
+        patch("src.feed_builder.database.save_episode"),
     ):
         add_episode(_make_metadata("2026-02-16"))
         add_episode(_make_metadata("2026-02-16"))

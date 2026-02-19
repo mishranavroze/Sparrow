@@ -51,7 +51,9 @@
       "Bash(lsof:*)",
       "Bash(grep:*)",
       "Bash(node --check:*)",
-      "Bash(pgrep:*)"
+      "Bash(pgrep:*)",
+      "WebFetch(domain:the-hootline.replit.app)",
+      "Bash(git push:*)"
     ]
   }
 }

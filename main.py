@@ -248,6 +248,9 @@ async def _scheduler() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start the background scheduler and check for missed runs on startup."""
+    # Sync RSS feed from database (source of truth) on every startup
+    feed_builder.sync_catalog_from_db()
+
     # Monday cleanup check on startup
     await _maybe_monday_cleanup()
 
