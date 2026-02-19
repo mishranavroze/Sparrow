@@ -1256,16 +1256,30 @@ function segmentCard() {
     ['CrossFit', 2], ['F1', 2], ['Arsenal', 1], ['Indian Cricket', 1],
     ['Badminton', 1], ['Sports', 1], ['Seattle', 1], ['Other', 1],
   ];
-  let s = '<div class="card"><div class="card-label">Segment Allocation</div>';
-  s += '<div style="display:grid;grid-template-columns:1fr auto;gap:2px 12px;font-size:11px;margin-top:6px;">';
-  let total = 0;
+  let s = '<div class="card"><div class="card-label">Show Format</div>';
+  // Intro
+  s += '<div style="font-size:11px;color:var(--text-dim);margin-top:6px;padding:6px 8px;background:rgba(255,255,255,0.03);border-radius:4px;">';
+  s += '<span style="color:var(--gold);font-weight:600;">Intro (~1 min)</span><br>';
+  s += 'Welcome to The Hootline, your daily knowledge briefing. Here\\'s a quick look at what we\\'re covering today: [topics]. Let\\'s dive in.';
+  s += '</div>';
+  // Segments
+  s += '<div style="display:grid;grid-template-columns:1fr auto;gap:2px 12px;font-size:11px;margin-top:8px;">';
+  let total = 2; // 1 min intro + 1 min outro
   for (const [name, mins] of segs) {
     total += mins;
     s += '<span style="color:var(--text);">' + name + '</span>';
     s += '<span style="color:var(--text-dim);text-align:right;">~' + mins + ' min</span>';
   }
-  s += '<span style="color:var(--gold);font-weight:600;border-top:1px solid var(--border);padding-top:4px;margin-top:4px;">Total</span>';
-  s += '<span style="color:var(--gold);font-weight:600;text-align:right;border-top:1px solid var(--border);padding-top:4px;margin-top:4px;">~' + total + ' min</span>';
+  s += '</div>';
+  // Outro
+  s += '<div style="font-size:11px;color:var(--text-dim);margin-top:8px;padding:6px 8px;background:rgba(255,255,255,0.03);border-radius:4px;">';
+  s += '<span style="color:var(--gold);font-weight:600;">Outro (~1 min)</span><br>';
+  s += 'That\\'s all for today\\'s Hootline. Thanks for listening — we\\'ll be back tomorrow with more. Until then, stay curious.';
+  s += '</div>';
+  // Total
+  s += '<div style="display:grid;grid-template-columns:1fr auto;gap:0 12px;font-size:11px;margin-top:8px;border-top:1px solid var(--border);padding-top:6px;">';
+  s += '<span style="color:var(--gold);font-weight:600;">Total</span>';
+  s += '<span style="color:var(--gold);font-weight:600;text-align:right;">~' + total + ' min</span>';
   s += '</div></div>';
   return s;
 }
