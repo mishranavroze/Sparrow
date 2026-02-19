@@ -20,7 +20,7 @@ from config import settings
 from src import database, episode_manager, feed_builder
 
 ACCEPTED_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".webm"}
-FFMPEG = shutil.which("ffmpeg") or "/nix/store/70cc3zmjy9j6gmg9r11y0xamjhp998jm-ffmpeg-full-6.1.2-bin/bin/ffmpeg"
+FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)

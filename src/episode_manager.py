@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 EPISODES_DIR = Path("output/episodes")
 
 # Resolve ffmpeg path at import time (nix PATH may not be available at runtime)
-FFMPEG = shutil.which("ffmpeg") or "/nix/store/70cc3zmjy9j6gmg9r11y0xamjhp998jm-ffmpeg-full-6.1.2-bin/bin/ffmpeg"
+FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 
 
 def _is_mp3(path: Path) -> bool:
