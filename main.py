@@ -87,10 +87,22 @@ def _calc_next_run() -> datetime:
     return target
 
 
+def _episode_date_for_latest_run() -> str:
+    """Get the episode date (PST) that the most recent scheduled run would produce."""
+    now_utc = datetime.now(UTC)
+    latest_run = now_utc.replace(
+        hour=settings.generation_hour, minute=settings.generation_minute,
+        second=0, microsecond=0,
+    )
+    if latest_run > now_utc:
+        latest_run -= timedelta(days=1)
+    # Episode date = PST date at generation time
+    return latest_run.astimezone(PST).strftime("%Y-%m-%d")
+
+
 def _today_digest_exists() -> bool:
-    """Check if a digest for today's UTC date already exists."""
-    today_str = datetime.now(UTC).strftime("%Y-%m-%d")
-    return database.get_digest(today_str) is not None
+    """Check if a digest for the most recent episode date already exists."""
+    return database.get_digest(_episode_date_for_latest_run()) is not None
 
 
 def _missed_todays_run() -> bool:
@@ -728,8 +740,8 @@ async def api_generate(force: bool = Query(False)):
 async def api_cron_generate(secret: str = Query("")):
     """External cron trigger for daily digest generation.
 
-    Call this from an external cron service (e.g. cron-job.org) at 07:30 UTC.
-    Requires the CRON_SECRET query parameter for authentication.
+    Call this from an external cron service (e.g. cron-job.org) at the
+    configured generation time. Requires the CRON_SECRET query parameter.
     """
     if not settings.cron_secret:
         return JSONResponse(

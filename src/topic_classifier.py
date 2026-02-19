@@ -104,6 +104,7 @@ SOURCE_TOPIC_MAP: dict[str, Topic] = {
     "the chai brief": Topic.INDIAN_POLITICS,
     "chai brief": Topic.INDIAN_POLITICS,
     "peter steinberger": Topic.TECH_AI,
+    "capitol hill seattle": Topic.SEATTLE,
     "interesting facts": Topic.OTHER,
     "better report": Topic.OTHER,
 }

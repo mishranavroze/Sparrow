@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from src.content_parser import _extract_sender_name
-from src.email_fetcher import _extract_body, _get_header, fetch_yesterdays_emails
+from src.email_fetcher import _extract_body, _get_header, fetch_todays_emails
 from src.exceptions import EmailFetchError
 
 
@@ -86,9 +86,9 @@ def test_extract_body_multipart():
     assert result_html == "<p>HTML text</p>"
 
 
-def test_fetch_yesterdays_emails_raises_without_credentials():
+def test_fetch_todays_emails_raises_without_credentials():
     with patch("src.email_fetcher.settings") as mock_settings:
         mock_settings.gmail_credentials_json = ""
         mock_settings.gmail_token_json = ""
         with pytest.raises(EmailFetchError, match="not configured"):
-            fetch_yesterdays_emails()
+            fetch_todays_emails()

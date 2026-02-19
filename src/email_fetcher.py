@@ -1,4 +1,4 @@
-"""Gmail API integration — fetch today's newsletter emails."""
+"""Gmail API integration — fetch newsletter emails for the daily digest."""
 
 import base64
 import json
@@ -82,20 +82,38 @@ def _get_header(headers: list[dict], name: str) -> str:
     return ""
 
 
-def fetch_yesterdays_emails() -> list[EmailMessage]:
-    """Fetch today's newsletter emails in PST (midnight PST to now).
+def fetch_todays_emails() -> list[EmailMessage]:
+    """Fetch newsletter emails for today's episode (24-hour window).
 
-    The generation runs at 11:30 PM PST, so this captures the full
-    PST day's emails up to that point.
+    Uses the configured generation schedule to compute a rolling 24-hour
+    window: from yesterday's cutoff time to today's cutoff time (PST).
+    Epoch timestamps ensure precise boundaries with no overlap between
+    consecutive digests.
 
     Returns:
-        List of EmailMessage objects for today's newsletters (PST).
+        List of EmailMessage objects for today's newsletters.
     """
     service = _get_gmail_service()
 
     PST = timezone(timedelta(hours=-8))
-    today_pst = datetime.now(PST).date()
-    query = f"after:{today_pst.isoformat()} before:{(today_pst + timedelta(days=1)).isoformat()}"
+    now_pst = datetime.now(PST)
+    today_pst = now_pst.date()
+
+    # Cutoff time in PST, derived from UTC generation schedule
+    cutoff_hour = (settings.generation_hour - 8) % 24
+    cutoff_min = settings.generation_minute
+
+    # Today's cutoff
+    cutoff_today = datetime(
+        today_pst.year, today_pst.month, today_pst.day,
+        hour=cutoff_hour, minute=cutoff_min, tzinfo=PST,
+    )
+
+    # 24-hour window: previous cutoff → now
+    start_boundary = cutoff_today - timedelta(days=1)
+    after_epoch = int(start_boundary.timestamp())
+    before_epoch = int(now_pst.timestamp())
+    query = f"after:{after_epoch} before:{before_epoch}"
     if settings.gmail_label:
         query = f"label:{settings.gmail_label} {query}"
 

@@ -3,7 +3,7 @@
 import json
 import logging
 from collections import defaultdict
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import requests
 
@@ -279,9 +279,9 @@ def compile(digest: DailyDigest) -> CompiledDigest:
     if not digest.articles:
         raise DigestCompileError("No articles to compile.")
 
-    # Generation runs at 11:30 PM PST = 07:30 UTC next day, so the UTC
-    # date is already the next PST calendar day (e.g. Feb 17 PST -> Feb 18 UTC).
-    episode_date = datetime.now(UTC).date()
+    # Episode is named for tonight's PST date (the evening it airs).
+    PST = timezone(timedelta(hours=-8))
+    episode_date = datetime.now(PST).date()
     date_ymd = episode_date.strftime("%Y-%m-%d")
     date_display = episode_date.strftime("%B %-d, %Y")
 

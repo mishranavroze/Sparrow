@@ -34,13 +34,13 @@ async def generate_digest_only() -> CompiledDigest | None:
 
     try:
         # 1. Fetch emails
-        logger.info("Step 1/3: Fetching yesterday's emails...")
+        logger.info("Step 1/3: Fetching today's emails...")
         database.log_step(run_id, "1. Fetch emails", "running")
         try:
-            emails = email_fetcher.fetch_yesterdays_emails()
+            emails = email_fetcher.fetch_todays_emails()
             if not emails:
-                logger.info("No newsletters yesterday. Skipping.")
-                database.log_step(run_id, "1. Fetch emails", "skipped", "No newsletters yesterday")
+                logger.info("No newsletters found. Skipping.")
+                database.log_step(run_id, "1. Fetch emails", "skipped", "No newsletters found")
                 database.finish_run(run_id, "success")
                 return None
             msg = f"Fetched {len(emails)} emails"

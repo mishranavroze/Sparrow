@@ -22,8 +22,8 @@ class Settings(BaseSettings):
     notebooklm_notebook_url: str = ""
     chrome_user_data_dir: str = "~/.noctua-chrome-profile"
 
-    # Podcast generation (schedule in UTC)
-    generation_hour: int = 7
+    # Podcast generation (schedule in UTC; 02:30 UTC = 6:30 PM PST)
+    generation_hour: int = 2
     generation_minute: int = 30
 
     # Secret for external cron trigger (e.g. cron-job.org)

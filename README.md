@@ -107,11 +107,11 @@ python generate.py
 
 ## Scheduling
 
-The scheduler is built into the app — no separate cron or deployment needed. When the FastAPI server starts, a background task automatically triggers generation at the configured `GENERATION_HOUR` (default: 18:00 UTC) every day.
+The scheduler is built into the app — no separate cron or deployment needed. When the FastAPI server starts, a background task automatically triggers generation at the configured `GENERATION_HOUR`:`GENERATION_MINUTE` UTC every day (default: 02:30 UTC = 6:30 PM PST).
 
 You can also trigger generation manually:
-- Click **"Generate Now"** in the dashboard header
-- Or `POST /api/generate`
+- Click **"Prepare Digest"** in the dashboard
+- Or `POST /api/start-preparation`
 
 The `/health` endpoint shows the next scheduled run time and whether generation is currently running.
 
