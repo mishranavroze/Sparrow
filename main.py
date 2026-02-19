@@ -895,6 +895,15 @@ async def api_publish_episode(date: str = Form("")):
     })
 
 
+@app.post("/api/bump-revision")
+async def api_bump_revision(date: str = Form("")):
+    """Bump the revision for an episode to force podcast apps to re-download."""
+    if not date or not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+        return JSONResponse({"error": "Invalid date format."}, status_code=400)
+    new_rev = feed_builder.bump_revision(date)
+    return JSONResponse({"status": "ok", "date": date, "revision": new_rev})
+
+
 @app.post("/api/cancel-preparation")
 async def api_cancel_preparation():
     """Cancel the preparation workflow.
@@ -1081,6 +1090,7 @@ DASHBOARD_HTML = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="/static/favicon.png">
 <title>The Hootline</title>
 <style>
   :root {

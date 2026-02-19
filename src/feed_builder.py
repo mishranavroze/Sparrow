@@ -157,8 +157,13 @@ def sync_catalog_from_db() -> None:
     """Rebuild episodes.json and feed.xml from the database.
 
     This ensures the RSS feed matches the database (source of truth)
-    after deploys or manual DB edits.
+    after deploys or manual DB edits. Preserves revision numbers from
+    the existing catalog (used for cache-busting with podcast services).
     """
+    # Preserve revision numbers from existing catalog
+    old_catalog = _load_episode_catalog()
+    old_revisions = {ep["date"]: ep.get("revision", 1) for ep in old_catalog}
+
     episodes_db = database.list_episodes()
     catalog = []
     for ep in episodes_db:
@@ -173,10 +178,30 @@ def sync_catalog_from_db() -> None:
         }
         if ep.get("gcs_url"):
             entry["gcs_url"] = ep["gcs_url"]
+        if old_revisions.get(ep["date"], 1) > 1:
+            entry["revision"] = old_revisions[ep["date"]]
         catalog.append(entry)
     _save_episode_catalog(catalog)
     build_feed()
     logger.info("Synced episodes.json from DB (%d episodes), feed rebuilt.", len(catalog))
+
+
+def bump_revision(date: str) -> int:
+    """Increment the revision for an episode, forcing podcast apps to re-download.
+
+    Returns the new revision number.
+    """
+    catalog = _load_episode_catalog()
+    new_rev = 1
+    for ep in catalog:
+        if ep["date"] == date:
+            ep["revision"] = ep.get("revision", 1) + 1
+            new_rev = ep["revision"]
+            break
+    _save_episode_catalog(catalog)
+    build_feed()
+    logger.info("Bumped revision for %s to v%d, feed rebuilt.", date, new_rev)
+    return new_rev
 
 
 def clear_feed() -> None:
