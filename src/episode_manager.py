@@ -2,6 +2,7 @@
 
 import logging
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -14,6 +15,9 @@ from src.models import EpisodeMetadata
 logger = logging.getLogger(__name__)
 
 EPISODES_DIR = Path("output/episodes")
+
+# Resolve ffmpeg path at import time (nix PATH may not be available at runtime)
+FFMPEG = shutil.which("ffmpeg") or "/nix/store/70cc3zmjy9j6gmg9r11y0xamjhp998jm-ffmpeg-full-6.1.2-bin/bin/ffmpeg"
 
 
 def _is_mp3(path: Path) -> bool:
@@ -35,7 +39,7 @@ def _convert_to_mp3(path: Path) -> Path:
     """Convert a non-MP3 audio file to MP3 using ffmpeg."""
     tmp_output = path.with_suffix(".tmp.mp3")
     cmd = [
-        "ffmpeg", "-i", str(path),
+        FFMPEG, "-i", str(path),
         "-codec:a", "libmp3lame", "-qscale:a", "2",
         "-y", str(tmp_output),
     ]

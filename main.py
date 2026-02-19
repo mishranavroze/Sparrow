@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import re
+import shutil
 import subprocess
 import zipfile
 from contextlib import asynccontextmanager
@@ -19,6 +20,7 @@ from config import settings
 from src import database, episode_manager, feed_builder
 
 ACCEPTED_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".webm"}
+FFMPEG = shutil.which("ffmpeg") or "/nix/store/70cc3zmjy9j6gmg9r11y0xamjhp998jm-ffmpeg-full-6.1.2-bin/bin/ffmpeg"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -962,7 +964,7 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
         try:
             logger.info("Converting %s (%d bytes) to MP3...", upload_path.name, upload_path.stat().st_size)
             result = subprocess.run(
-                ["ffmpeg", "-i", str(upload_path), "-codec:a", "libmp3lame", "-qscale:a", "2", "-y", str(mp3_path)],
+                [FFMPEG, "-i", str(upload_path), "-codec:a", "libmp3lame", "-qscale:a", "2", "-y", str(mp3_path)],
                 capture_output=True, text=True, timeout=300,
             )
             upload_path.unlink(missing_ok=True)
