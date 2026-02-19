@@ -436,33 +436,40 @@ async def api_topic_coverage(
     grand_total = sum(totals.values())
     has_data = grand_total > 0
 
-    # Per-topic actual as % of allocated time covered:
-    # expected_articles = (topic_minutes / total_minutes) * grand_total
-    # actual_pct = (actual_articles / expected_articles) * 100
-    # Target is always 100% (fully covered)
+    # Per-topic actual as % of segment capacity filled.
+    # Capacity = max(2, round(mins * 1.5)) articles — same cap used in the digest compiler.
+    # The radar is capped at 100% (content is hard-capped in the digest).
+    # But we track the raw incoming count to detect over-coverage (wasted sources).
+    num_digests = max(len(digests), 1)
     topics = []
     for topic in SEGMENT_ORDER:
         name = topic.value
         mins = duration_map.get(name, 1)
+        capacity = max(2, round(mins * 1.5))  # matches digest_compiler capping
         actual_articles = totals.get(name, 0)
         if has_data:
-            expected = (mins / total_minutes) * grand_total
-            actual_pct = (actual_articles / expected) * 100 if expected > 0 else 0
+            # Average articles per digest for this segment
+            avg_articles = actual_articles / num_digests
+            # Radar display: capped at 100%
+            actual_pct = min(avg_articles / capacity, 1.0) * 100
+            # Raw ratio: how much is actually coming in vs capacity (can exceed 100%)
+            raw_pct = (avg_articles / capacity) * 100
         else:
             actual_pct = 0
-        gap = actual_pct - 100  # positive = over-covered, negative = under-covered
+            raw_pct = 0
         # Label includes allocated minutes
         label = f"{name} ({mins}m)"
         topics.append({
             "name": label,
             "target_pct": 100,
             "actual_pct": round(actual_pct, 1),
+            "raw_pct": round(raw_pct, 1),
             "actual_articles": actual_articles,
             "allocated_min": mins,
-            "gap": round(gap, 1),
+            "capacity": capacity,
         })
 
-    # Suggestions (only when we have actual data)
+    # Suggestions based on raw incoming coverage
     suggestions = []
     if has_data:
         for topic_enum, t in zip(SEGMENT_ORDER, topics):
@@ -471,14 +478,14 @@ async def api_topic_coverage(
                 suggestions.append({
                     "topic": t["name"],
                     "action": "subscribe",
-                    "reason": f"Only {t['actual_pct']:.0f}% covered — consider adding sources",
+                    "reason": f"Only {t['actual_pct']:.0f}% filled — consider adding sources",
                 })
-            elif t["actual_pct"] > 200:
+            elif t["raw_pct"] > 200:
                 src_list = ", ".join(topic_sources) if topic_sources else "unknown"
                 suggestions.append({
                     "topic": t["name"],
                     "action": "unsubscribe",
-                    "reason": f"{t['actual_pct']:.0f}% covered — current sources: {src_list}",
+                    "reason": f"{t['raw_pct']:.0f}% incoming vs capacity — content being discarded. Sources: {src_list}",
                 })
 
     return JSONResponse({
@@ -1429,7 +1436,7 @@ async function loadRadar(mode, containerId) {
     }
     h += '</div>';
     h += '<canvas id="' + canvasId + '" width="500" height="500" style="display:block;margin:0 auto;"></canvas>';
-    h += '<div class="radar-legend"><span><span class="sw" style="background:rgba(196,160,82,0.6);"></span>Target (100%)</span>';
+    h += '<div class="radar-legend"><span><span class="sw" style="background:rgba(196,160,82,0.6);"></span>Capacity (100%)</span>';
     h += '<span><span class="sw" style="background:rgba(96,165,250,0.6);"></span>Actual</span></div>';
     const lbl = mode==='latest' ? 'latest digest' : data.digests_analyzed + ' digests';
     h += '<div class="radar-stats">' + lbl + ' &middot; ' + data.total_articles + ' articles' + (!data.has_data?' &middot; no coverage data yet':'') + '</div>';
@@ -1469,22 +1476,22 @@ function drawRadar(topics, hasActual, canvasId) {
   if (!cv) return;
   const ctx = cv.getContext('2d');
   const W = cv.width, H = cv.height;
-  const cx = W/2, cy = H/2, R = Math.min(cx,cy)-75, n = topics.length, mx = 150;
+  const cx = W/2, cy = H/2, R = Math.min(cx,cy)-75, n = topics.length, mx = 100;
   ctx.clearRect(0,0,W,H);
 
   const ang = i => (Math.PI*2*i/n) - Math.PI/2;
   const pt = (i,p) => { const a=ang(i), r=(Math.min(p,mx)/mx)*R; return [cx+r*Math.cos(a), cy+r*Math.sin(a)]; };
 
-  // Grid rings at 50%, 100%, 150%
-  [50,100,150].forEach(r => {
+  // Grid rings at 25%, 50%, 75%, 100%
+  [25,50,75,100].forEach(r => {
     ctx.beginPath();
     for (let i=0;i<=n;i++) { const [x,y]=pt(i%n,r); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); }
     ctx.closePath();
     ctx.strokeStyle = r===100 ? '#4a4d5e' : '#2e3140';
     ctx.lineWidth = r===100 ? 1.2 : 0.5;
     ctx.stroke();
-    // Label the 100% ring
-    if (r===100) { ctx.font='8px monospace'; ctx.fillStyle='#5a5d6e'; ctx.textAlign='left'; ctx.fillText('100%',cx+3,cy-((r/mx)*R)-2); }
+    if (r===100) { ctx.font='8px monospace'; ctx.fillStyle='#5a5d6e'; ctx.textAlign='left'; ctx.fillText('100%',cx+3,cy-R-2); }
+    if (r===50) { ctx.font='8px monospace'; ctx.fillStyle='#3a3d4e'; ctx.textAlign='left'; ctx.fillText('50%',cx+3,cy-((r/mx)*R)-2); }
   });
 
   // Spokes
