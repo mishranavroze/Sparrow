@@ -71,12 +71,12 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
     for ep in sorted(episodes, key=lambda e: e["date"], reverse=True)[:MAX_FEED_EPISODES]:
         fe = fg.add_entry()
         # Use GCS URL if available, otherwise fall back to local URL
+        # Always include file size as version param so podcast apps
+        # re-download if the audio file changes.
         if ep.get("gcs_url"):
             mp3_url = ep["gcs_url"]
         else:
-            revision = ep.get("revision", 1)
-            rev_suffix = f"?v={revision}" if revision > 1 else ""
-            mp3_url = f"{settings.base_url}/episodes/noctua-{ep['date']}.mp3{rev_suffix}"
+            mp3_url = f"{settings.base_url}/episodes/noctua-{ep['date']}.mp3?v={ep['file_size_bytes']}"
 
         fe.id(mp3_url)
 
