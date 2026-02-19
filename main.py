@@ -20,7 +20,9 @@ from config import settings
 from src import database, episode_manager, feed_builder
 
 ACCEPTED_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".webm"}
-FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
+def _ffmpeg_path() -> str:
+    """Resolve ffmpeg at call time (PATH may not be ready at import)."""
+    return shutil.which("ffmpeg") or "ffmpeg"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -138,6 +140,11 @@ async def _run_generation() -> None:
             _preparation_date = datetime.now(PST).strftime("%Y-%m-%d")
             _preparation_digest = None
             _preparation_error = None
+            # Remove any leftover .prep.mp3 from a previous session
+            stale_prep = EPISODES_DIR / f"noctua-{_preparation_date}.prep.mp3"
+            if stale_prep.exists():
+                stale_prep.unlink()
+                logger.info("Removed stale prep file: %s", stale_prep.name)
 
         try:
             await _maybe_monday_cleanup()
@@ -967,7 +974,7 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
         try:
             logger.info("Converting %s (%d bytes) to MP3...", upload_path.name, upload_path.stat().st_size)
             result = subprocess.run(
-                [FFMPEG, "-i", str(upload_path), "-codec:a", "libmp3lame", "-qscale:a", "2", "-y", str(mp3_path)],
+                [_ffmpeg_path(), "-i", str(upload_path), "-codec:a", "libmp3lame", "-qscale:a", "2", "-y", str(mp3_path)],
                 capture_output=True, text=True, timeout=300,
             )
             upload_path.unlink(missing_ok=True)
@@ -987,9 +994,11 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
                 status_code=422,
             )
         except FileNotFoundError:
+            ffpath = _ffmpeg_path()
+            logger.error("ffmpeg not found. Resolved path: %s, which: %s", ffpath, shutil.which("ffmpeg"))
             upload_path.unlink(missing_ok=True)
             return JSONResponse(
-                {"error": "ffmpeg not found. Cannot convert audio."},
+                {"error": f"ffmpeg not found (path={ffpath}). Cannot convert audio."},
                 status_code=500,
             )
 
@@ -1037,6 +1046,8 @@ async def health() -> dict:
         "generation_running": _generation_running,
         "next_scheduled_run": _next_scheduled_run.isoformat() if _next_scheduled_run else None,
         "generation_schedule_utc": f"{settings.generation_hour:02d}:{settings.generation_minute:02d}",
+        "ffmpeg": _ffmpeg_path(),
+        "ffmpeg_available": shutil.which("ffmpeg") is not None,
     }
 
 
