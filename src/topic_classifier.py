@@ -1,5 +1,6 @@
 """Classify newsletter articles into podcast topic segments."""
 
+import json
 import logging
 import re
 from enum import StrEnum
@@ -7,6 +8,7 @@ from enum import StrEnum
 from src.models import Article
 
 logger = logging.getLogger(__name__)
+
 
 
 class Topic(StrEnum):
@@ -84,8 +86,6 @@ SOURCE_TOPIC_MAP: dict[str, Topic] = {
     "tldr": Topic.TECH_AI,
     "ben's bites": Topic.TECH_AI,
     "the verge": Topic.TECH_AI,
-    "nyt wirecutter": Topic.PRODUCT_MANAGEMENT,
-    "wirecutter": Topic.PRODUCT_MANAGEMENT,
     "lenny's newsletter": Topic.PRODUCT_MANAGEMENT,
     "the product compass": Topic.PRODUCT_MANAGEMENT,
     "department of product": Topic.PRODUCT_MANAGEMENT,
@@ -303,3 +303,124 @@ def classify_article(article: Article) -> Topic | None:
         "Keyword classify: '%s' -> %s (score=%d)", article.title, best_topic, best_score
     )
     return best_topic
+
+
+# --- AI batch classification ---
+
+CLASSIFICATION_SYSTEM_PROMPT = """\
+You are a newsletter article classifier for a daily podcast called "The Hootline".
+
+Classify each article into exactly ONE of these topics:
+- "World Politics" — international relations, diplomacy, global conflicts, UN/NATO/EU
+- "US Politics" — US Congress, White House, Supreme Court, elections, federal policy
+- "Indian Politics" — India government, economy, domestic affairs
+- "Latest in Tech" — AI, software, startups, cybersecurity, tech industry news, gadgets, consumer electronics, product reviews
+- "Entertainment" — movies, TV, music, books, games, celebrities, awards
+- "Product Management" — PM practices, roadmaps, metrics, OKRs, user research, A/B testing, sprint planning — NOT consumer product reviews
+- "CrossFit" — CrossFit workouts, competitions, athletes
+- "Formula 1" — F1 races, drivers, teams, Grand Prix
+- "Arsenal" — Arsenal FC football/soccer
+- "Indian Cricket" — men's AND women's Indian cricket, IPL, BCCI, Indian cricket players
+- "Badminton" — badminton tournaments, BWF, shuttlers
+- "Sports" — other sports (NFL, NBA, tennis, golf, Olympics, etc.)
+- "Seattle" — Seattle local news, Pacific Northwest
+- "Misc" — anything that doesn't fit above
+
+Also identify NON-CONTENT emails that should be FILTERED OUT:
+- Welcome/onboarding emails, subscription confirmations
+- Product recommendation lists ("best X to buy")
+- Surveys, feedback requests
+- Newsletter cross-promotions ("you might also like...")
+- Account notifications, receipts
+
+Respond with a JSON array. Each element: {"id": <number>, "topic": "<topic>", "filtered": <true/false>}
+If filtered is true, topic should be "FILTER".
+Only output the JSON array, nothing else."""
+
+# Valid topic strings the AI can return
+_VALID_TOPICS = {t.value for t in Topic}
+
+
+def classify_articles_batch(articles: list[Article]) -> dict[int, Topic | None]:
+    """Classify a list of articles using AI with regex fallback.
+
+    Args:
+        articles: Articles to classify (must have source, title, content set).
+
+    Returns:
+        Mapping of article list index to Topic (or None if filtered).
+    """
+    from src.llm_client import call_haiku
+    from src.exceptions import ClaudeAPIError
+
+    results: dict[int, Topic | None] = {}
+    ai_batch: list[tuple[int, Article]] = []
+
+    # Fast path: sender map + transactional filter
+    for i, article in enumerate(articles):
+        if _is_filtered_sender(article.source):
+            results[i] = None
+            continue
+
+        source_lower = _normalize(article.source)
+        matched = False
+        for source_key, topic in SOURCE_TOPIC_MAP.items():
+            if source_key in source_lower or source_lower in source_key:
+                results[i] = topic
+                matched = True
+                break
+
+        if not matched:
+            ai_batch.append((i, article))
+
+    if not ai_batch:
+        return results
+
+    # AI path: send ambiguous articles to Haiku
+    try:
+        lines = []
+        for idx, (i, article) in enumerate(ai_batch):
+            preview = article.content[:300].replace("\n", " ")
+            lines.append(f'{{"id": {idx}, "source": "{article.source}", "title": "{article.title}", "preview": "{preview}"}}')
+        user_message = "Classify these articles:\n\n" + "\n".join(lines)
+
+        response = call_haiku(
+            system=CLASSIFICATION_SYSTEM_PROMPT,
+            user_message=user_message,
+            max_tokens=1024,
+            temperature=0.0,
+            timeout=30,
+        )
+
+        # Parse JSON response
+        response = response.strip()
+        if response.startswith("```"):
+            response = response.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+        classifications = json.loads(response)
+
+        for item in classifications:
+            idx = item["id"]
+            if idx < 0 or idx >= len(ai_batch):
+                continue
+            original_index = ai_batch[idx][0]
+
+            if item.get("filtered", False):
+                results[original_index] = None
+                logger.info("AI filtered: '%s'", ai_batch[idx][1].title)
+            elif item["topic"] in _VALID_TOPICS:
+                results[original_index] = Topic(item["topic"])
+                logger.debug("AI classified: '%s' -> %s", ai_batch[idx][1].title, item["topic"])
+            else:
+                results[original_index] = Topic.OTHER
+                logger.warning("AI returned unknown topic '%s' for '%s'", item["topic"], ai_batch[idx][1].title)
+
+    except (ClaudeAPIError, json.JSONDecodeError, KeyError) as e:
+        logger.warning("AI classification failed (%s), falling back to regex", e)
+
+    # Fallback: any articles not yet classified use regex
+    for i, article in enumerate(articles):
+        if i not in results:
+            results[i] = classify_article(article)
+
+    return results

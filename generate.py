@@ -10,6 +10,7 @@ from src import (
     database,
     digest_compiler,
     email_fetcher,
+    twitter_fetcher,
 )
 from src.exceptions import (
     ContentParseError,
@@ -33,30 +34,40 @@ async def generate_digest_only() -> CompiledDigest | None:
     database.start_run(run_id)
 
     try:
-        # 1. Fetch emails
-        logger.info("Step 1/3: Fetching today's emails...")
-        database.log_step(run_id, "1. Fetch emails", "running")
+        # 1. Fetch sources (emails + tweets)
+        logger.info("Step 1/3: Fetching today's sources...")
+        database.log_step(run_id, "1. Fetch sources", "running")
         try:
             emails = email_fetcher.fetch_todays_emails()
-            if not emails:
-                logger.info("No newsletters found. Skipping.")
-                database.log_step(run_id, "1. Fetch emails", "skipped", "No newsletters found")
+
+            # Tweets are best-effort — don't fail the pipeline if Nitter is down
+            tweets = []
+            try:
+                tweets = twitter_fetcher.fetch_todays_tweets()
+            except Exception as e:
+                logger.warning("Twitter fetch failed (non-fatal): %s", e)
+
+            all_content = emails + tweets
+
+            if not all_content:
+                logger.info("No sources found. Skipping.")
+                database.log_step(run_id, "1. Fetch sources", "skipped", "No sources found")
                 database.finish_run(run_id, "success")
                 return None
-            msg = f"Fetched {len(emails)} emails"
+            msg = f"Fetched {len(emails)} emails + {len(tweets)} tweets"
             logger.info(msg)
-            database.log_step(run_id, "1. Fetch emails", "success", msg)
+            database.log_step(run_id, "1. Fetch sources", "success", msg)
         except EmailFetchError as e:
             logger.error("Email fetch failed: %s", e)
-            database.log_step(run_id, "1. Fetch emails", "failed", str(e))
+            database.log_step(run_id, "1. Fetch sources", "failed", str(e))
             database.finish_run(run_id, "failed", str(e))
             raise
 
         # 2. Parse content
-        logger.info("Step 2/3: Parsing email content...")
+        logger.info("Step 2/3: Parsing and classifying email content (AI-assisted)...")
         database.log_step(run_id, "2. Parse content", "running")
         try:
-            digest = content_parser.parse_emails(emails)
+            digest = content_parser.parse_emails(all_content)
             if not digest.articles:
                 logger.info("No articles extracted. Skipping.")
                 database.log_step(
@@ -74,10 +85,12 @@ async def generate_digest_only() -> CompiledDigest | None:
             raise
 
         # 3. Compile digest and save to database
-        logger.info("Step 3/3: Compiling digest...")
+        logger.info("Step 3/3: Compiling AI-summarized digest...")
         database.log_step(run_id, "3. Compile digest", "running")
         try:
             compiled = digest_compiler.compile(digest)
+            compiled.email_count = len(emails)
+            compiled.tweet_count = len(tweets)
 
             # Check if this date's digest is locked (episode already uploaded)
             if database.has_episode(compiled.date):
@@ -94,6 +107,8 @@ async def generate_digest_only() -> CompiledDigest | None:
                 total_words=compiled.total_words,
                 topics_summary=compiled.topics_summary,
                 rss_summary=compiled.rss_summary,
+                email_count=compiled.email_count,
+                tweet_count=compiled.tweet_count,
                 segment_counts=compiled.segment_counts,
                 segment_sources=compiled.segment_sources,
             )

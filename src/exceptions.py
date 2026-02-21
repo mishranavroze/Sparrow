@@ -37,5 +37,9 @@ class EpisodeProcessError(NoctuaError):
     """Raised when processing a downloaded episode fails."""
 
 
+class ClaudeAPIError(NoctuaError):
+    """Raised when a Claude API call fails."""
+
+
 class FeedBuildError(NoctuaError):
     """Raised when building the RSS feed fails."""

@@ -62,9 +62,10 @@ def test_source_map_cassidoo():
     assert classify_article(article) == Topic.TECH_AI
 
 
-def test_source_map_wirecutter():
+def test_wirecutter_not_product_management():
+    """Wirecutter is consumer product reviews, NOT Product Management."""
     article = _make_article(source="NYT Wirecutter", title="Best Laptops")
-    assert classify_article(article) == Topic.PRODUCT_MANAGEMENT
+    assert classify_article(article) != Topic.PRODUCT_MANAGEMENT
 
 
 def test_source_map_athletic():

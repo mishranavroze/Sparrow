@@ -15,8 +15,8 @@ class Settings(BaseSettings):
     google_account_email: str = ""
     google_account_password: str = ""
 
-    # Optional: Claude API for digest summarization
-    anthropic_api_key: str = ""
+    # Gemini API for AI classification and summarization
+    gemini_api_key: str = ""
 
     # NotebookLM
     notebooklm_notebook_url: str = ""

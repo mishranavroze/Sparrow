@@ -53,7 +53,9 @@
       "Bash(node --check:*)",
       "Bash(pgrep:*)",
       "WebFetch(domain:the-hootline.replit.app)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(git -C /home/runner/workspace diff --stat)",
+      "Bash(git -C /home/runner/workspace diff --stat -- src/claude_client.py 2>/dev/null; git -C /home/runner/workspace status -- src/claude_client.py)"
     ]
   }
 }

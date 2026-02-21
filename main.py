@@ -361,12 +361,16 @@ async def api_latest_episode():
         latest_digest = database.get_digest(all_digests[0]["date"])
         if latest_digest:
             has_ep = database.has_episode(latest_digest["date"])
+            seg_counts = json.loads(latest_digest.get("segment_counts") or "{}")
             digest_meta = {
                 "date": latest_digest["date"],
                 "article_count": latest_digest["article_count"],
                 "total_words": latest_digest["total_words"],
                 "total_chars": len(latest_digest["markdown_text"]),
+                "email_count": latest_digest.get("email_count", 0),
+                "tweet_count": latest_digest.get("tweet_count", 0),
                 "topics_summary": latest_digest["topics_summary"],
+                "segment_counts": seg_counts,
                 "download_url": f"/digests/{latest_digest['date']}.md",
                 "locked": has_ep,
             }
@@ -404,7 +408,10 @@ async def api_latest_episode():
                 "article_count": _preparation_digest.article_count,
                 "total_words": _preparation_digest.total_words,
                 "total_chars": len(_preparation_digest.text),
+                "email_count": _preparation_digest.email_count,
+                "tweet_count": _preparation_digest.tweet_count,
                 "topics_summary": _preparation_digest.topics_summary,
+                "segment_counts": _preparation_digest.segment_counts or {},
                 "download_url": "/api/preparation-digest",
             } if has_digest else None,
             "audio": {
@@ -565,6 +572,8 @@ async def api_history():
             "article_count": d["article_count"],
             "total_words": d["total_words"],
             "total_chars": len(full["markdown_text"]) if full else 0,
+            "email_count": d.get("email_count", 0),
+            "tweet_count": d.get("tweet_count", 0),
             "topics_summary": d["topics_summary"],
             "has_digest": True,
             "has_audio": has_audio,
@@ -1341,6 +1350,48 @@ function segmentCard() {
   return s;
 }
 
+function topicBreakdown(d) {
+  if (!d || !d.segment_counts) return '';
+  const sc = d.segment_counts;
+  const durMap = {
+    'Latest in Tech':5,'Product Management':4,'World Politics':4,
+    'US Politics':3,'Indian Politics':3,'Entertainment':3,
+    'CrossFit':2,'Formula 1':2,'Arsenal':1,'Indian Cricket':1,
+    'Badminton':1,'Sports':1,'Seattle':1,'Misc':1
+  };
+  const order = Object.keys(durMap);
+  let rows = '';
+  let totalArticles = 0, totalMins = 0;
+  for (const topic of order) {
+    const count = sc[topic] || 0;
+    if (count === 0) continue;
+    const mins = durMap[topic] || 1;
+    const words = mins * 150;
+    totalArticles += count;
+    totalMins += mins;
+    rows += '<span style="color:var(--text);">' + esc(topic) + '</span>';
+    rows += '<span style="color:var(--text-dim);text-align:right;">' + count + '</span>';
+    rows += '<span style="color:var(--text-dim);text-align:right;">~' + words + '</span>';
+    rows += '<span style="color:var(--text-dim);text-align:right;">~' + mins + ' min</span>';
+  }
+  if (!rows) return '';
+  let s = '<div class="card" style="margin-top:8px;"><div class="card-label">Topic Breakdown</div>';
+  s += '<div style="display:grid;grid-template-columns:1fr auto auto auto;gap:2px 12px;font-size:11px;margin-top:6px;">';
+  s += '<span style="color:var(--accent);font-weight:600;">Topic</span>';
+  s += '<span style="color:var(--accent);font-weight:600;text-align:right;">Articles</span>';
+  s += '<span style="color:var(--accent);font-weight:600;text-align:right;">Words</span>';
+  s += '<span style="color:var(--accent);font-weight:600;text-align:right;">Duration</span>';
+  s += rows;
+  s += '</div>';
+  s += '<div style="display:grid;grid-template-columns:1fr auto auto auto;gap:0 12px;font-size:11px;margin-top:6px;border-top:1px solid var(--border);padding-top:4px;">';
+  s += '<span style="color:var(--gold);font-weight:600;">Total</span>';
+  s += '<span style="color:var(--gold);font-weight:600;text-align:right;">' + totalArticles + '</span>';
+  s += '<span style="color:var(--gold);font-weight:600;text-align:right;">~' + (totalMins*150) + '</span>';
+  s += '<span style="color:var(--gold);font-weight:600;text-align:right;">~' + totalMins + ' min</span>';
+  s += '</div></div>';
+  return s;
+}
+
 async function loadLatest() {
   let res, data;
   try {
@@ -1376,9 +1427,10 @@ async function loadLatest() {
   if (data.digest) {
     const d = data.digest;
     h += '<div class="card"><div class="card-label">Today\\'s Digest</div><div class="digest-row"><div>';
-    h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + d.total_words.toLocaleString() + ' words &middot; ' + d.total_chars.toLocaleString() + ' chars</div>';
+    h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + (d.email_count||0) + ' emails &middot; ' + (d.tweet_count||0) + ' tweets &middot; ' + d.total_words.toLocaleString() + ' words</div>';
     h += '<div class="digest-topics">' + esc(d.topics_summary||'') + '</div>';
     h += '</div><a class="dl-btn" href="' + d.download_url + '" download>Download .md</a></div></div>';
+    h += topicBreakdown(d);
   }
 
   if (data.episode) {
@@ -1427,9 +1479,10 @@ function renderPreparation(prep) {
   if (prep.digest) {
     const d = prep.digest;
     h += '<div class="card"><div class="card-label">New Digest Ready</div><div class="digest-row"><div>';
-    h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + d.total_words.toLocaleString() + ' words &middot; ' + d.total_chars.toLocaleString() + ' chars</div>';
+    h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + (d.email_count||0) + ' emails &middot; ' + (d.tweet_count||0) + ' tweets &middot; ' + d.total_words.toLocaleString() + ' words</div>';
     h += '<div class="digest-topics">' + esc(d.topics_summary||'') + '</div>';
     h += '</div><a class="dl-btn" href="' + d.download_url + '" download>Download .md</a></div></div>';
+    h += topicBreakdown(d);
   }
 
   if (prep.state === 'digest_ready') {
@@ -1645,7 +1698,7 @@ async function loadHistory() {
       }
 
       const dDetail = r.has_digest
-        ? '<span class="h-detail">'+r.article_count+' articles &middot; '+r.total_words.toLocaleString()+' words &middot; '+r.total_chars.toLocaleString()+' chars</span>'
+        ? '<span class="h-detail">'+r.article_count+' articles &middot; '+(r.email_count||0)+' emails &middot; '+(r.tweet_count||0)+' tweets &middot; '+r.total_words.toLocaleString()+' words</span>'
         : '<span class="h-detail">&mdash;</span>';
 
       let aDetail = '&mdash;';

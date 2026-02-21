@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 
 from src.exceptions import ContentParseError
 from src.models import Article, DailyDigest, EmailMessage
-from src.topic_classifier import classify_article, _is_filtered_sender
+from src.topic_classifier import _is_filtered_sender, classify_articles_batch
 
 logger = logging.getLogger(__name__)
 
@@ -170,13 +170,6 @@ def parse_emails(emails: list[EmailMessage]) -> DailyDigest:
                 estimated_words=word_count,
             )
 
-            # Classify article into a topic segment
-            topic = classify_article(article)
-            if topic is None:
-                logger.info("Filtered article by classification: '%s'", email.subject)
-                continue
-            article.topic = topic.value
-
             articles.append(article)
 
         except Exception as e:
@@ -185,7 +178,22 @@ def parse_emails(emails: list[EmailMessage]) -> DailyDigest:
                 f"Failed to parse email '{email.subject}': {e}"
             ) from e
 
+    # Deduplicate before classification (saves AI calls)
     articles = _deduplicate_articles(articles)
+
+    # Batch classify all articles at once (AI-assisted with regex fallback)
+    if articles:
+        classifications = classify_articles_batch(articles)
+        classified: list[Article] = []
+        for i, article in enumerate(articles):
+            topic = classifications.get(i)
+            if topic is None:
+                logger.info("Filtered article by classification: '%s'", article.title)
+                continue
+            article.topic = topic.value
+            classified.append(article)
+        articles = classified
+
     total_words = sum(a.estimated_words for a in articles)
 
     logger.info("Parsed %d articles (%d words)", len(articles), total_words)
