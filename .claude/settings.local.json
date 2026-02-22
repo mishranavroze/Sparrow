@@ -59,7 +59,9 @@
       "Bash(for inst in \"https://nitter.net\" \"https://nitter.privacydev.net\" \"https://nitter.poast.org\"; do\n  echo -n \"$inst: \"\n  curl -s -o /dev/null -w \"%{http_code}\" --max-time 5 \"$inst/svpino/rss\" 2>&1\n  echo\ndone)",
       "WebSearch",
       "WebFetch(domain:pypi.org)",
-      "WebFetch(domain:medium.com)"
+      "WebFetch(domain:medium.com)",
+      "Bash(git show HEAD:output/noctua.db > /dev/null 2>&1 && echo \"noctua.db IS tracked in git\" || echo \"noctua.db NOT tracked in git\"\ngit ls-files output/ 2>&1\necho \"---\"\ncat .gitignore 2>&1 | head -30)",
+      "Bash(git rm --cached output/noctua.db output/episodes.json output/sparrow/noctua.db output/sparrow/episodes.json output/sparrow/feed.xml 2>&1)"
     ]
   }
 }

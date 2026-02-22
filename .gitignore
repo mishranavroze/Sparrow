@@ -13,10 +13,17 @@ build/
 # Environment
 .env
 
-# Generated output
-output/episodes/*.mp3
-output/feed.xml
+# Generated output (databases, feeds, episodes, exports — all per-show)
+output/**/noctua.db
+output/**/feed.xml
+output/**/episodes.json
+output/**/episodes/*.mp3
+output/**/exports/
 output/noctua.db
+output/feed.xml
+output/episodes.json
+output/episodes/*.mp3
+output/exports/
 
 # IDE
 .vscode/

@@ -236,12 +236,14 @@ def _monday_cleanup(state: ShowState) -> None:
             digest_count = _add_digests_to_zip(zf, mon, sun, db_path=db_path)
         logger.info("[%s] Archived %d episodes + %d digests to %s", show.show_id, len(mp3s), digest_count, zip_name)
 
-    for mp3 in episodes_dir.glob("noctua-*.mp3"):
+    for mp3 in mp3s:
         mp3.unlink()
         logger.info("[%s] Deleted %s", show.show_id, mp3.name)
 
-    feed_builder.clear_feed(show=show)
+    # Only delete last week's digests from DB — never touch the feed/episodes catalog;
+    # sync_catalog_from_db will rebuild the feed from whatever episodes remain in the DB.
     database.delete_digests_between(mon, sun, db_path=db_path)
+    feed_builder.sync_catalog_from_db(show=show)
     logger.info("[%s] Monday cleanup complete for %s (%s to %s)", show.show_id, week_label, mon, sun)
 
 
