@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
+from config import ShowConfig
 from src.exceptions import DigestCompileError
 from src.models import Article, CompiledDigest, DailyDigest
 from src.topic_classifier import SEGMENT_DURATIONS, SEGMENT_ORDER, Topic
@@ -20,7 +21,7 @@ WORDS_PER_MINUTE = 150
 
 PODCAST_PREAMBLE = """\
 **PODCAST PRODUCTION INSTRUCTIONS:**
-This is a pre-written podcast script for "The Hootline".
+This is a pre-written podcast script for "{podcast_name}".
 - Start with a warm welcome, mention today's date ({date}), and briefly \
 mention the weather in Seattle
 - The script flows as a continuous narrative — do NOT announce topic \
@@ -33,18 +34,18 @@ changes mechanically ("now let's talk about...")
 
 INTRO_SECTION = """\
 ## INTRO (~1 minute)
-Welcome to The Hootline! Today is {date}. {weather}Let's get into what's happening.
+Welcome to {podcast_name}! Today is {date}. {weather}Let's get into what's happening.
 """
 
 OUTRO_SECTION = """\
 ## OUTRO (~1 minute)
-And that wraps up today's Hootline! We hope you found something in there \
+And that wraps up today's {podcast_name}! We hope you found something in there \
 that made you smile, think, or learn something new. Remember — every day \
 brings new possibilities. Thanks for listening, and we'll see you next time. Bye!
 """
 
-SUMMARIZATION_SYSTEM_PROMPT = """\
-You are a script writer for "The Hootline", a daily news podcast.
+SUMMARIZATION_SYSTEM_PROMPT_TEMPLATE = """\
+You are a script writer for "{podcast_name}", a daily news podcast.
 Write a segment that flows as part of a larger narrative — not a \
 standalone block. Synthesize the key points conversationally.
 Do NOT use bullet points or list format. Do NOT include host labels \
@@ -81,7 +82,7 @@ def _build_topics_summary(digest: DailyDigest, segment_counts: dict[str, int]) -
     return "; ".join(parts) if parts else "No segments"
 
 
-def _generate_rss_summary(articles: list[Article]) -> str:
+def _generate_rss_summary(articles: list[Article], podcast_name: str = "The Hootline") -> str:
     """Generate a short (~15 word) episode description using the Claude API."""
     from src.llm_client import call_haiku
     from src.exceptions import ClaudeAPIError
@@ -108,16 +109,19 @@ def _generate_rss_summary(articles: list[Article]) -> str:
         return summary
     except (ClaudeAPIError, Exception) as e:
         logger.warning("RSS summary generation failed: %s — using fallback", e)
-        return "Your nightly knowledge briefing from The Hootline."
+        return f"Your nightly knowledge briefing from {podcast_name}."
 
 
-def _summarize_segment(topic: Topic, articles: list[Article], word_budget: int) -> str | None:
+def _summarize_segment(topic: Topic, articles: list[Article], word_budget: int,
+                       podcast_name: str = "The Hootline") -> str | None:
     """Use Claude Sonnet to write a narrative summary for a topic segment.
 
     Returns the summary text, or None if the API call fails.
     """
     from src.llm_client import call_sonnet
     from src.exceptions import ClaudeAPIError
+
+    system_prompt = SUMMARIZATION_SYSTEM_PROMPT_TEMPLATE.format(podcast_name=podcast_name)
 
     article_texts = []
     for a in articles:
@@ -134,7 +138,7 @@ def _summarize_segment(topic: Topic, articles: list[Article], word_budget: int) 
 
     try:
         return call_sonnet(
-            system=SUMMARIZATION_SYSTEM_PROMPT,
+            system=system_prompt,
             user_message=user_message,
             max_tokens=word_budget * 3,
             temperature=0.3,
@@ -197,7 +201,7 @@ def _raw_fallback_segment(articles: list[Article], word_budget: int) -> str:
 
 
 def _compile_text(
-    digest: DailyDigest, date_str: str
+    digest: DailyDigest, date_str: str, podcast_name: str = "The Hootline"
 ) -> tuple[str, dict[str, int], dict[str, list[str]]]:
     """Compile articles into a segment-structured markdown document with AI summaries."""
     # Group articles by topic
@@ -232,11 +236,11 @@ def _compile_text(
     weather = _fetch_seattle_weather()
 
     # Build the document
-    intro = INTRO_SECTION.format(date=date_str, weather=weather)
-    outro = OUTRO_SECTION
-    preamble = PODCAST_PREAMBLE.format(date=date_str)
+    intro = INTRO_SECTION.format(podcast_name=podcast_name, date=date_str, weather=weather)
+    outro = OUTRO_SECTION.format(podcast_name=podcast_name)
+    preamble = PODCAST_PREAMBLE.format(podcast_name=podcast_name, date=date_str)
 
-    sections = [f"# The Hootline — Daily Briefing — {date_str}\n"]
+    sections = [f"# {podcast_name} — Daily Briefing — {date_str}\n"]
     sections.append(preamble)
     sections.append(intro)
 
@@ -264,7 +268,7 @@ def _compile_text(
         sections.append(section_header)
 
         # Try AI summarization, fall back to raw text
-        summary = _summarize_segment(topic, articles, word_budget)
+        summary = _summarize_segment(topic, articles, word_budget, podcast_name=podcast_name)
         if summary:
             sections.append(summary)
         else:
@@ -286,10 +290,17 @@ def _compile_text(
     return text, segment_counts, segment_sources
 
 
-def compile(digest: DailyDigest) -> CompiledDigest:
-    """Compile all articles into a single well-structured text document."""
+def compile(digest: DailyDigest, show: ShowConfig | None = None) -> CompiledDigest:
+    """Compile all articles into a single well-structured text document.
+
+    Args:
+        digest: The daily digest containing articles to compile.
+        show: Show-specific config for podcast name. Falls back to "The Hootline".
+    """
     if not digest.articles:
         raise DigestCompileError("No articles to compile.")
+
+    podcast_name = show.podcast_title if show else "The Hootline"
 
     PST = timezone(timedelta(hours=-8))
     episode_date = datetime.now(PST).date()
@@ -297,9 +308,11 @@ def compile(digest: DailyDigest) -> CompiledDigest:
     date_display = episode_date.strftime("%B %-d, %Y")
 
     try:
-        text, segment_counts, segment_sources = _compile_text(digest, date_display)
+        text, segment_counts, segment_sources = _compile_text(
+            digest, date_display, podcast_name=podcast_name
+        )
         topics_summary = _build_topics_summary(digest, segment_counts)
-        rss_summary = _generate_rss_summary(digest.articles)
+        rss_summary = _generate_rss_summary(digest.articles, podcast_name=podcast_name)
         total_words = len(text.split())
 
         compiled = CompiledDigest(

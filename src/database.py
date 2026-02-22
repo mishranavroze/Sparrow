@@ -8,13 +8,14 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path("output/noctua.db")
+DEFAULT_DB_PATH = Path("output/noctua.db")
 
 
-def _get_connection() -> sqlite3.Connection:
+def _get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     """Get a database connection, creating the DB and tables if needed."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    path = db_path or DEFAULT_DB_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     _create_tables(conn)
@@ -83,13 +84,9 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE episodes ADD COLUMN gcs_url TEXT NOT NULL DEFAULT ''")
     except sqlite3.OperationalError:
         pass  # Column already exists
-    # Migrate: add email_count and tweet_count columns to digests if missing
+    # Migrate: add email_count column to digests if missing
     try:
         conn.execute("ALTER TABLE digests ADD COLUMN email_count INTEGER NOT NULL DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        conn.execute("ALTER TABLE digests ADD COLUMN tweet_count INTEGER NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
         pass
     conn.commit()
@@ -97,9 +94,9 @@ def _create_tables(conn: sqlite3.Connection) -> None:
 
 # --- Digest CRUD ---
 
-def has_episode(date: str) -> bool:
+def has_episode(date: str, db_path: Path | None = None) -> bool:
     """Check if an episode exists for the given date."""
-    conn = _get_connection()
+    conn = _get_connection(db_path)
     try:
         row = conn.execute(
             "SELECT 1 FROM episodes WHERE date = ?", (date,)
@@ -111,26 +108,27 @@ def has_episode(date: str) -> bool:
 
 def save_digest(date: str, markdown_text: str, article_count: int,
                 total_words: int, topics_summary: str, rss_summary: str = "",
-                email_count: int = 0, tweet_count: int = 0,
+                email_count: int = 0,
                 segment_counts: dict[str, int] | None = None,
                 segment_sources: dict[str, list[str]] | None = None,
-                force: bool = False) -> None:
+                force: bool = False,
+                db_path: Path | None = None) -> None:
     """Save or update a daily digest.
 
     Refuses to overwrite if an episode already exists for this date (locked),
     unless force=True (used when user explicitly publishes a new episode).
     """
-    if not force and has_episode(date):
+    if not force and has_episode(date, db_path=db_path):
         logger.warning("Digest for %s is locked (episode exists) — skipping overwrite.", date)
         return
 
-    conn = _get_connection()
+    conn = _get_connection(db_path)
     try:
         conn.execute(
             """INSERT INTO digests (date, markdown_text, article_count, total_words,
-               topics_summary, rss_summary, email_count, tweet_count,
+               topics_summary, rss_summary, email_count,
                segment_counts, segment_sources, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(date) DO UPDATE SET
                markdown_text=excluded.markdown_text,
                article_count=excluded.article_count,
@@ -138,12 +136,11 @@ def save_digest(date: str, markdown_text: str, article_count: int,
                topics_summary=excluded.topics_summary,
                rss_summary=excluded.rss_summary,
                email_count=excluded.email_count,
-               tweet_count=excluded.tweet_count,
                segment_counts=excluded.segment_counts,
                segment_sources=excluded.segment_sources,
                created_at=excluded.created_at""",
             (date, markdown_text, article_count, total_words, topics_summary,
-             rss_summary, email_count, tweet_count,
+             rss_summary, email_count,
              json.dumps(segment_counts or {}),
              json.dumps(segment_sources or {}),
              datetime.now(UTC).isoformat()),
@@ -154,9 +151,9 @@ def save_digest(date: str, markdown_text: str, article_count: int,
         conn.close()
 
 
-def get_digest(date: str) -> dict | None:
+def get_digest(date: str, db_path: Path | None = None) -> dict | None:
     """Get a single digest by date."""
-    conn = _get_connection()
+    conn = _get_connection(db_path)
     try:
         row = conn.execute(
             "SELECT * FROM digests WHERE date = ?", (date,)
@@ -166,12 +163,12 @@ def get_digest(date: str) -> dict | None:
         conn.close()
 
 
-def list_digests(limit: int = 50) -> list[dict]:
+def list_digests(limit: int = 50, db_path: Path | None = None) -> list[dict]:
     """List recent digests (most recent first)."""
-    conn = _get_connection()
+    conn = _get_connection(db_path)
     try:
         rows = conn.execute(
-            "SELECT id, date, article_count, total_words, email_count, tweet_count, topics_summary, created_at "
+            "SELECT id, date, article_count, total_words, email_count, topics_summary, created_at "
             "FROM digests ORDER BY date DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -180,7 +177,7 @@ def list_digests(limit: int = 50) -> list[dict]:
         conn.close()
 
 
-def delete_digest(date: str) -> bool:
+def delete_digest(date: str, db_path: Path | None = None) -> bool:
     """Delete a single digest by date.
 
     Args:
@@ -189,7 +186,7 @@ def delete_digest(date: str) -> bool:
     Returns:
         True if a row was deleted, False otherwise.
     """
-    conn = _get_connection()
+    conn = _get_connection(db_path)
     try:
         cursor = conn.execute("DELETE FROM digests WHERE date = ?", (date,))
         conn.commit()
@@ -201,7 +198,7 @@ def delete_digest(date: str) -> bool:
         conn.close()
 
 
-def delete_digests_between(start: str, end: str) -> int:
+def delete_digests_between(start: str, end: str, db_path: Path | None = None) -> int:
     """Delete digests in a date range (inclusive).
 
     Args:
@@ -211,7 +208,7 @@ def delete_digests_between(start: str, end: str) -> int:
     Returns:
         Number of rows deleted.
     """
-    conn = _get_connection()
+    conn = _get_connection(db_path)
     try:
         cursor = conn.execute(
             "DELETE FROM digests WHERE date BETWEEN ? AND ?", (start, end)
@@ -224,14 +221,15 @@ def delete_digests_between(start: str, end: str) -> int:
         conn.close()
 
 
-def get_topic_coverage(limit: int = 30, published_only: bool = False) -> list[dict]:
+def get_topic_coverage(limit: int = 30, published_only: bool = False,
+                       db_path: Path | None = None) -> list[dict]:
     """Get segment_counts and segment_sources from recent digests for topic coverage analysis.
 
     Args:
         limit: Max number of digests to return.
         published_only: If True, only return digests that have a published episode.
     """
-    conn = _get_connection()
+    conn = _get_connection(db_path)
     try:
         if published_only:
             rows = conn.execute(
@@ -258,7 +256,7 @@ def get_topic_coverage(limit: int = 30, published_only: bool = False) -> list[di
 
 # --- Episode Archive ---
 
-def delete_episode(date: str) -> bool:
+def delete_episode(date: str, db_path: Path | None = None) -> bool:
     """Delete an episode record by date.
 
     Args:
@@ -267,7 +265,7 @@ def delete_episode(date: str) -> bool:
     Returns:
         True if a row was deleted, False otherwise.
     """
-    conn = _get_connection()
+    conn = _get_connection(db_path)
     try:
         cursor = conn.execute("DELETE FROM episodes WHERE date = ?", (date,))
         conn.commit()
@@ -281,9 +279,10 @@ def delete_episode(date: str) -> bool:
 
 def save_episode(date: str, file_size_bytes: int, duration_seconds: int,
                  duration_formatted: str, topics_summary: str,
-                 rss_summary: str = "", gcs_url: str = "") -> None:
+                 rss_summary: str = "", gcs_url: str = "",
+                 db_path: Path | None = None) -> None:
     """Permanently archive an episode. This record is never deleted."""
-    conn = _get_connection()
+    conn = _get_connection(db_path)
     try:
         conn.execute(
             """INSERT INTO episodes (date, file_size_bytes, duration_seconds,
@@ -306,9 +305,9 @@ def save_episode(date: str, file_size_bytes: int, duration_seconds: int,
         conn.close()
 
 
-def list_episodes(limit: int = 0) -> list[dict]:
+def list_episodes(limit: int = 0, db_path: Path | None = None) -> list[dict]:
     """List all archived episodes (most recent first). No limit by default."""
-    conn = _get_connection()
+    conn = _get_connection(db_path)
     try:
         query = "SELECT * FROM episodes ORDER BY date DESC"
         if limit > 0:
@@ -321,9 +320,9 @@ def list_episodes(limit: int = 0) -> list[dict]:
 
 # --- Pipeline Run Logging ---
 
-def start_run(run_id: str) -> None:
+def start_run(run_id: str, db_path: Path | None = None) -> None:
     """Record the start of a pipeline run."""
-    conn = _get_connection()
+    conn = _get_connection(db_path)
     try:
         conn.execute(
             "INSERT INTO pipeline_runs (run_id, started_at, status, steps_log) "
@@ -335,9 +334,10 @@ def start_run(run_id: str) -> None:
         conn.close()
 
 
-def log_step(run_id: str, step: str, status: str, message: str = "") -> None:
+def log_step(run_id: str, step: str, status: str, message: str = "",
+             db_path: Path | None = None) -> None:
     """Log a pipeline step to the current run."""
-    conn = _get_connection()
+    conn = _get_connection(db_path)
     try:
         row = conn.execute(
             "SELECT steps_log FROM pipeline_runs WHERE run_id = ?", (run_id,)
@@ -362,9 +362,10 @@ def log_step(run_id: str, step: str, status: str, message: str = "") -> None:
         conn.close()
 
 
-def finish_run(run_id: str, status: str, error_message: str = "") -> None:
+def finish_run(run_id: str, status: str, error_message: str = "",
+               db_path: Path | None = None) -> None:
     """Mark a pipeline run as finished."""
-    conn = _get_connection()
+    conn = _get_connection(db_path)
     try:
         conn.execute(
             "UPDATE pipeline_runs SET status = ?, finished_at = ?, error_message = ? "
@@ -376,9 +377,9 @@ def finish_run(run_id: str, status: str, error_message: str = "") -> None:
         conn.close()
 
 
-def list_runs(limit: int = 20) -> list[dict]:
+def list_runs(limit: int = 20, db_path: Path | None = None) -> list[dict]:
     """List recent pipeline runs (most recent first)."""
-    conn = _get_connection()
+    conn = _get_connection(db_path)
     try:
         rows = conn.execute(
             "SELECT * FROM pipeline_runs ORDER BY started_at DESC LIMIT ?",
@@ -394,9 +395,9 @@ def list_runs(limit: int = 20) -> list[dict]:
         conn.close()
 
 
-def get_run(run_id: str) -> dict | None:
+def get_run(run_id: str, db_path: Path | None = None) -> dict | None:
     """Get a single pipeline run by run_id."""
-    conn = _get_connection()
+    conn = _get_connection(db_path)
     try:
         row = conn.execute(
             "SELECT * FROM pipeline_runs WHERE run_id = ?", (run_id,)

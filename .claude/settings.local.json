@@ -55,7 +55,11 @@
       "WebFetch(domain:the-hootline.replit.app)",
       "Bash(git push:*)",
       "Bash(git -C /home/runner/workspace diff --stat)",
-      "Bash(git -C /home/runner/workspace diff --stat -- src/claude_client.py 2>/dev/null; git -C /home/runner/workspace status -- src/claude_client.py)"
+      "Bash(git -C /home/runner/workspace diff --stat -- src/claude_client.py 2>/dev/null; git -C /home/runner/workspace status -- src/claude_client.py)",
+      "Bash(for inst in \"https://nitter.net\" \"https://nitter.privacydev.net\" \"https://nitter.poast.org\"; do\n  echo -n \"$inst: \"\n  curl -s -o /dev/null -w \"%{http_code}\" --max-time 5 \"$inst/svpino/rss\" 2>&1\n  echo\ndone)",
+      "WebSearch",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:medium.com)"
     ]
   }
 }

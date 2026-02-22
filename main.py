@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import zipfile
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -16,8 +17,9 @@ from fastapi import FastAPI, Form, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from config import settings
+from config import ShowConfig, settings, shows
 from src import database, episode_manager, feed_builder
+from src.models import CompiledDigest
 
 ACCEPTED_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".webm"}
 def _ffmpeg_path() -> str:
@@ -33,11 +35,6 @@ def _ffmpeg_path() -> str:
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
-
-EPISODES_DIR = Path("output/episodes")
-EPISODES_JSON = Path("output/episodes.json")
-FEED_PATH = Path("output/feed.xml")
-EXPORTS_DIR = Path("output/exports")
 
 PST = timezone(timedelta(hours=-8))
 
@@ -61,32 +58,47 @@ def _week_date_range(dt: datetime) -> tuple[str, str]:
     return monday.strftime("%Y-%m-%d"), sunday.strftime("%Y-%m-%d")
 
 
-def _add_digests_to_zip(zf: zipfile.ZipFile, mon: str, sun: str) -> int:
-    """Add digest .md files for dates in [mon, sun] to an open ZipFile.
-
-    Returns the number of digests added.
-    """
+def _add_digests_to_zip(zf: zipfile.ZipFile, mon: str, sun: str,
+                        db_path: Path | None = None) -> int:
+    """Add digest .md files for dates in [mon, sun] to an open ZipFile."""
     count = 0
-    digests = database.list_digests(limit=100)
+    digests = database.list_digests(limit=100, db_path=db_path)
     for d in digests:
         if mon <= d["date"] <= sun:
-            full = database.get_digest(d["date"])
+            full = database.get_digest(d["date"], db_path=db_path)
             if full and full["markdown_text"]:
                 zf.writestr(f"noctua-digest-{d['date']}.md", full["markdown_text"])
                 count += 1
     return count
 
-# --- Generation state ---
-_generation_lock = asyncio.Lock()
-_generation_running = False
+
+# --- Per-show state ---
+
+@dataclass
+class ShowState:
+    """Mutable per-show state for the preparation workflow."""
+
+    show: ShowConfig
+    generation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    generation_running: bool = False
+    preparation_active: bool = False
+    preparation_date: str | None = None
+    preparation_cancelled: bool = False
+    preparation_digest: CompiledDigest | None = None
+    preparation_error: str | None = None
+
+
+# Registry: populated during lifespan startup
+_show_states: dict[str, ShowState] = {}
 _next_scheduled_run: datetime | None = None
 
-# --- Preparation workflow state ---
-_preparation_active = False
-_preparation_date: str | None = None
-_preparation_cancelled = False
-_preparation_digest = None  # CompiledDigest stored in memory during preparation
-_preparation_error: str | None = None  # Error message if generation failed
+
+def _resolve_show(show_id: str = "") -> ShowState:
+    """Resolve a show_id to its ShowState. Defaults to the first show."""
+    if show_id and show_id in _show_states:
+        return _show_states[show_id]
+    # Default to the first configured show
+    return next(iter(_show_states.values()))
 
 
 def _calc_next_run() -> datetime:
@@ -107,140 +119,138 @@ def _episode_date_for_latest_run() -> str:
     )
     if latest_run > now_utc:
         latest_run -= timedelta(days=1)
-    # Episode date = PST date at generation time
     return latest_run.astimezone(PST).strftime("%Y-%m-%d")
 
 
-def _today_digest_exists() -> bool:
+def _today_digest_exists(state: ShowState) -> bool:
     """Check if a digest for the most recent episode date already exists."""
-    return database.get_digest(_episode_date_for_latest_run()) is not None
+    return database.get_digest(_episode_date_for_latest_run(), db_path=state.show.db_path) is not None
 
 
-def _missed_todays_run() -> bool:
+def _missed_todays_run(state: ShowState) -> bool:
     """Return True if the scheduled time already passed today and no digest exists yet."""
     now = datetime.now(UTC)
     target = now.replace(hour=settings.generation_hour, minute=settings.generation_minute, second=0, microsecond=0)
-    return now > target and not _today_digest_exists()
+    return now > target and not _today_digest_exists(state)
 
 
-async def _run_generation() -> None:
-    """Run digest preparation (steps 1-3), guarded by a lock.
-
-    Always keeps the digest in memory (preparation mode) so the user
-    can review, upload audio, and explicitly publish. This applies to
-    both scheduled runs and manual triggers.
-    """
-    global _generation_running, _preparation_active, _preparation_date
-    global _preparation_cancelled, _preparation_digest, _preparation_error
+async def _run_generation(state: ShowState) -> None:
+    """Run digest preparation (steps 1-3), guarded by a lock."""
     from generate import generate_digest_only
 
-    if _generation_lock.locked():
-        logger.warning("Generation already in progress, skipping.")
+    show = state.show
+
+    if state.generation_lock.locked():
+        logger.warning("[%s] Generation already in progress, skipping.", show.show_id)
         return
 
-    async with _generation_lock:
-        _generation_running = True
+    async with state.generation_lock:
+        state.generation_running = True
 
-        # Always enter preparation mode — digest stays in memory until Publish.
-        if not _preparation_active:
-            _preparation_active = True
-            _preparation_date = datetime.now(PST).strftime("%Y-%m-%d")
-            _preparation_digest = None
-            _preparation_error = None
-            # Remove any leftover .prep.mp3 from a previous session
-            stale_prep = EPISODES_DIR / f"noctua-{_preparation_date}.prep.mp3"
+        if not state.preparation_active:
+            state.preparation_active = True
+            state.preparation_date = datetime.now(PST).strftime("%Y-%m-%d")
+            state.preparation_digest = None
+            state.preparation_error = None
+            stale_prep = show.episodes_dir / f"noctua-{state.preparation_date}.prep.mp3"
             if stale_prep.exists():
                 stale_prep.unlink()
-                logger.info("Removed stale prep file: %s", stale_prep.name)
+                logger.info("[%s] Removed stale prep file: %s", show.show_id, stale_prep.name)
 
         try:
-            await _maybe_monday_cleanup()
+            await _maybe_monday_cleanup(state)
 
-            # Suppress DB save — keep digest in memory only
             original_save = database.save_digest
             database.save_digest = lambda *args, **kwargs: None
             try:
-                result = await generate_digest_only()
+                def _run_sync():
+                    loop = asyncio.new_event_loop()
+                    try:
+                        return loop.run_until_complete(generate_digest_only(show=show))
+                    finally:
+                        loop.close()
+
+                result = await asyncio.to_thread(_run_sync)
             finally:
                 database.save_digest = original_save
 
-            if _preparation_cancelled:
-                _preparation_digest = None
-                _preparation_error = None
-                logger.info("Preparation cancelled — discarded in-memory digest")
+            if state.preparation_cancelled:
+                state.preparation_digest = None
+                state.preparation_error = None
+                logger.info("[%s] Preparation cancelled — discarded in-memory digest", show.show_id)
             elif result is None:
-                _preparation_digest = None
-                _preparation_error = "No newsletters found — nothing to prepare."
-                logger.info("Preparation returned no digest (no emails/articles)")
+                state.preparation_digest = None
+                state.preparation_error = "No newsletters found — nothing to prepare."
+                logger.info("[%s] Preparation returned no digest (no emails/articles)", show.show_id)
             else:
-                _preparation_digest = result
-                _preparation_error = None
-                logger.info("Preparation digest ready (in-memory only)")
+                state.preparation_digest = result
+                state.preparation_error = None
+                logger.info("[%s] Preparation digest ready (in-memory only)", show.show_id)
         except Exception as e:
-            logger.error("Digest preparation failed: %s", e)
-            _preparation_error = f"Generation failed: {e}"
+            logger.error("[%s] Digest preparation failed: %s", show.show_id, e)
+            state.preparation_error = f"Generation failed: {e}"
         finally:
-            _generation_running = False
-            _preparation_cancelled = False
+            state.generation_running = False
+            state.preparation_cancelled = False
 
 
-def _last_week_mp3s_exist() -> bool:
+def _last_week_mp3s_exist(state: ShowState) -> bool:
     """Check if MP3s from last week are still on disk."""
-    if not EPISODES_DIR.exists():
+    episodes_dir = state.show.episodes_dir
+    if not episodes_dir.exists():
         return False
     now = _pst_now()
     last_week = now - timedelta(weeks=1)
     mon, sun = _week_date_range(last_week)
-    for mp3 in EPISODES_DIR.glob("noctua-*.mp3"):
+    for mp3 in episodes_dir.glob("noctua-*.mp3"):
         date_str = mp3.stem.removeprefix("noctua-")
         if mon <= date_str <= sun:
             return True
     return False
 
 
-def _monday_cleanup() -> None:
+def _monday_cleanup(state: ShowState) -> None:
     """Archive last week's MP3s, then clear episodes and digests for that week."""
+    show = state.show
+    episodes_dir = show.episodes_dir
+    exports_dir = show.exports_dir
+    db_path = show.db_path
+
     now = _pst_now()
     last_week = now - timedelta(weeks=1)
     mon, sun = _week_date_range(last_week)
     week_label = _iso_week_label(last_week)
 
-    # Collect last week's MP3s
     mp3s = sorted(
-        mp3 for mp3 in EPISODES_DIR.glob("noctua-*.mp3")
+        mp3 for mp3 in episodes_dir.glob("noctua-*.mp3")
         if mon <= mp3.stem.removeprefix("noctua-") <= sun
     )
 
-    # Archive into ZIP if MP3s exist and ZIP doesn't yet
-    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    zip_name = f"hootline-{week_label}.zip"
-    zip_path = EXPORTS_DIR / zip_name
+    exports_dir.mkdir(parents=True, exist_ok=True)
+    zip_name = f"{show.show_id}-{week_label}.zip"
+    zip_path = exports_dir / zip_name
     if mp3s and not zip_path.exists():
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
             for mp3 in mp3s:
                 zf.write(mp3, mp3.name)
-            digest_count = _add_digests_to_zip(zf, mon, sun)
-        logger.info("Archived %d episodes + %d digests to %s", len(mp3s), digest_count, zip_name)
+            digest_count = _add_digests_to_zip(zf, mon, sun, db_path=db_path)
+        logger.info("[%s] Archived %d episodes + %d digests to %s", show.show_id, len(mp3s), digest_count, zip_name)
 
-    # Delete ALL local noctua-*.mp3 files
-    for mp3 in EPISODES_DIR.glob("noctua-*.mp3"):
+    for mp3 in episodes_dir.glob("noctua-*.mp3"):
         mp3.unlink()
-        logger.info("Deleted %s", mp3.name)
+        logger.info("[%s] Deleted %s", show.show_id, mp3.name)
 
-    # Clear the RSS feed
-    feed_builder.clear_feed()
-
-    # Remove last week's digest rows
-    database.delete_digests_between(mon, sun)
-    logger.info("Monday cleanup complete for %s (%s to %s)", week_label, mon, sun)
+    feed_builder.clear_feed(show=show)
+    database.delete_digests_between(mon, sun, db_path=db_path)
+    logger.info("[%s] Monday cleanup complete for %s (%s to %s)", show.show_id, week_label, mon, sun)
 
 
-async def _maybe_monday_cleanup() -> None:
+async def _maybe_monday_cleanup(state: ShowState) -> None:
     """Run Monday cleanup if it's Monday PST and last week's MP3s still exist."""
     now = _pst_now()
-    if now.weekday() == 0 and _last_week_mp3s_exist():
-        logger.info("Monday PST detected — running weekly cleanup.")
-        _monday_cleanup()
+    if now.weekday() == 0 and _last_week_mp3s_exist(state):
+        logger.info("[%s] Monday PST detected — running weekly cleanup.", state.show.show_id)
+        _monday_cleanup(state)
 
 
 async def _scheduler() -> None:
@@ -255,33 +265,34 @@ async def _scheduler() -> None:
             wait_seconds / 60,
         )
         await asyncio.sleep(max(wait_seconds, 0))
-        logger.info("Scheduler: triggering daily generation.")
-        await _run_generation()
+        logger.info("Scheduler: triggering daily generation for all shows.")
+        for state in _show_states.values():
+            asyncio.create_task(_run_generation(state))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Start the background scheduler and check for missed runs on startup."""
-    # Ensure output directories exist
-    EPISODES_DIR.mkdir(parents=True, exist_ok=True)
-    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    # Initialize per-show state
+    for show_id, show in shows.items():
+        _show_states[show_id] = ShowState(show=show)
 
-    # Sync RSS feed from database (source of truth) on every startup
-    feed_builder.sync_catalog_from_db()
+    # Ensure output directories exist and sync feeds for all shows
+    for state in _show_states.values():
+        show = state.show
+        show.episodes_dir.mkdir(parents=True, exist_ok=True)
+        show.exports_dir.mkdir(parents=True, exist_ok=True)
+        feed_builder.sync_catalog_from_db(show=show)
+        await _maybe_monday_cleanup(state)
 
-    # Monday cleanup check on startup
-    await _maybe_monday_cleanup()
-
-    # Check if we missed today's run (e.g. autoscale spun down during scheduled time).
-    # This also handles restart recovery: if the digest was in memory and the server
-    # crashed, the digest is lost, so re-generation is triggered and enters
-    # preparation mode automatically.
-    if _missed_todays_run():
-        logger.info("Startup: missed today's scheduled run — triggering now.")
-        asyncio.create_task(_run_generation())
+        if _missed_todays_run(state):
+            logger.info("[%s] Startup: missed today's scheduled run — triggering now.", show.show_id)
+            asyncio.create_task(_run_generation(state))
 
     task = asyncio.create_task(_scheduler())
-    logger.info("Background scheduler started (%02d:%02d UTC).", settings.generation_hour, settings.generation_minute)
+    logger.info("Background scheduler started (%02d:%02d UTC). Shows: %s",
+                settings.generation_hour, settings.generation_minute,
+                ", ".join(_show_states.keys()))
     yield
     task.cancel()
     try:
@@ -296,95 +307,135 @@ app = FastAPI(title="The Hootline", description="Daily podcast generator", lifes
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
+# --- API: Show discovery ---
+
+@app.get("/api/shows")
+async def api_shows():
+    """List all configured shows."""
+    return JSONResponse([
+        {"id": s.show.show_id, "title": s.show.podcast_title}
+        for s in _show_states.values()
+    ])
+
+
 # --- Dashboard ---
 
 @app.get("/")
 async def dashboard():
-    """Main dashboard showing latest episode with audio player and digest."""
+    """Main dashboard (default show)."""
     return HTMLResponse(
-        content=DASHBOARD_HTML,
+        content=_build_dashboard_html(),
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
     )
 
 
+@app.get("/{show_id}/")
+async def show_dashboard(show_id: str):
+    """Show-specific dashboard."""
+    if show_id not in _show_states:
+        return Response(content="Show not found.", status_code=404)
+    return HTMLResponse(
+        content=_build_dashboard_html(show_id),
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
+# --- API endpoints (show_id query parameter) ---
+
 @app.get("/api/digests")
-async def api_digests():
+async def api_digests(show_id: str = Query(default="")):
     """List all digests."""
-    return JSONResponse(database.list_digests())
+    state = _resolve_show(show_id)
+    return JSONResponse(database.list_digests(db_path=state.show.db_path))
 
 
 @app.get("/api/digests/{date}")
-async def api_digest(date: str):
+async def api_digest(date: str, show_id: str = Query(default="")):
     """Get a single digest by date."""
-    digest = database.get_digest(date)
+    state = _resolve_show(show_id)
+    digest = database.get_digest(date, db_path=state.show.db_path)
     if not digest:
         return JSONResponse({"error": "Digest not found"}, status_code=404)
     return JSONResponse(digest)
 
 
 @app.get("/api/runs")
-async def api_runs():
+async def api_runs(show_id: str = Query(default="")):
     """List pipeline runs."""
-    return JSONResponse(database.list_runs())
+    state = _resolve_show(show_id)
+    return JSONResponse(database.list_runs(db_path=state.show.db_path))
 
 
 @app.get("/api/runs/{run_id}")
-async def api_run(run_id: str):
+async def api_run(run_id: str, show_id: str = Query(default="")):
     """Get a single pipeline run."""
-    run = database.get_run(run_id)
+    state = _resolve_show(show_id)
+    run = database.get_run(run_id, db_path=state.show.db_path)
     if not run:
         return JSONResponse({"error": "Run not found"}, status_code=404)
     return JSONResponse(run)
 
 
 @app.get("/api/latest-episode")
-async def api_latest_episode():
+async def api_latest_episode(show_id: str = Query(default="")):
     """Get the latest episode and the latest digest."""
-    # Load episodes catalog
+    state = _resolve_show(show_id)
+    show = state.show
+    episodes_json = show.episodes_json_path
+    episodes_dir = show.episodes_dir
+    db_path = show.db_path
+
+    # Determine URL prefix for episodes
+    is_legacy = show.output_dir == Path("output")
+    ep_url_prefix = "/episodes" if is_legacy else f"/{show.show_id}/episodes"
+
     episode_data = None
-    if EPISODES_JSON.exists():
-        episodes = json.loads(EPISODES_JSON.read_text())
+    if episodes_json.exists():
+        episodes = json.loads(episodes_json.read_text())
         if episodes:
-            # Find the most recent episode that actually has a reachable audio file
             for candidate in sorted(episodes, key=lambda e: e["date"], reverse=True):
                 gcs_url = candidate.get("gcs_url", "")
-                local_file = EPISODES_DIR / f"noctua-{candidate['date']}.mp3"
+                local_file = episodes_dir / f"noctua-{candidate['date']}.mp3"
                 if gcs_url or local_file.exists():
-                    audio_url = gcs_url or f"/episodes/noctua-{candidate['date']}.mp3"
+                    audio_url = gcs_url or f"{ep_url_prefix}/noctua-{candidate['date']}.mp3"
                     episode_data = {**candidate, "audio_url": audio_url}
                     break
 
-    # Get the most recent digest (independent of episode date)
     digest_meta = None
-    all_digests = database.list_digests(limit=1)
+    all_digests = database.list_digests(limit=1, db_path=db_path)
     if all_digests:
-        latest_digest = database.get_digest(all_digests[0]["date"])
+        latest_digest = database.get_digest(all_digests[0]["date"], db_path=db_path)
         if latest_digest:
-            has_ep = database.has_episode(latest_digest["date"])
+            has_ep = database.has_episode(latest_digest["date"], db_path=db_path)
             seg_counts = json.loads(latest_digest.get("segment_counts") or "{}")
+
+            # Digest download URL
+            if is_legacy:
+                dl_url = f"/digests/{latest_digest['date']}.md"
+            else:
+                dl_url = f"/{show.show_id}/digests/{latest_digest['date']}.md"
+
             digest_meta = {
                 "date": latest_digest["date"],
                 "article_count": latest_digest["article_count"],
                 "total_words": latest_digest["total_words"],
                 "total_chars": len(latest_digest["markdown_text"]),
                 "email_count": latest_digest.get("email_count", 0),
-                "tweet_count": latest_digest.get("tweet_count", 0),
                 "topics_summary": latest_digest["topics_summary"],
                 "segment_counts": seg_counts,
-                "download_url": f"/digests/{latest_digest['date']}.md",
+                "download_url": dl_url,
                 "locked": has_ep,
             }
 
-    # Build preparation state for the frontend
     prep = None
-    if _preparation_active and _preparation_date:
-        prep_mp3 = EPISODES_DIR / f"noctua-{_preparation_date}.prep.mp3"
+    if state.preparation_active and state.preparation_date:
+        prep_mp3 = episodes_dir / f"noctua-{state.preparation_date}.prep.mp3"
         has_mp3 = prep_mp3.exists()
-        has_digest = _preparation_digest is not None
+        has_digest = state.preparation_digest is not None
 
-        if _generation_running:
+        if state.generation_running:
             prep_state = "generating"
-        elif _preparation_error:
+        elif state.preparation_error:
             prep_state = "failed"
         elif has_digest and has_mp3:
             prep_state = "audio_uploaded"
@@ -393,30 +444,28 @@ async def api_latest_episode():
         else:
             prep_state = "generating"
 
-        # Check if there's an existing published episode for this date
-        existing_episode = database.has_episode(_preparation_date)
+        existing_episode = database.has_episode(state.preparation_date, db_path=db_path)
 
         prep = {
             "active": True,
-            "generating": _generation_running,
+            "generating": state.generation_running,
             "state": prep_state,
-            "date": _preparation_date,
+            "date": state.preparation_date,
             "existing_episode": existing_episode,
-            "error": _preparation_error,
+            "error": state.preparation_error,
             "digest": {
-                "date": _preparation_digest.date,
-                "article_count": _preparation_digest.article_count,
-                "total_words": _preparation_digest.total_words,
-                "total_chars": len(_preparation_digest.text),
-                "email_count": _preparation_digest.email_count,
-                "tweet_count": _preparation_digest.tweet_count,
-                "topics_summary": _preparation_digest.topics_summary,
-                "segment_counts": _preparation_digest.segment_counts or {},
-                "download_url": "/api/preparation-digest",
+                "date": state.preparation_digest.date,
+                "article_count": state.preparation_digest.article_count,
+                "total_words": state.preparation_digest.total_words,
+                "total_chars": len(state.preparation_digest.text),
+                "email_count": state.preparation_digest.email_count,
+                "topics_summary": state.preparation_digest.topics_summary,
+                "segment_counts": state.preparation_digest.segment_counts or {},
+                "download_url": f"/api/preparation-digest?show_id={show.show_id}",
             } if has_digest else None,
             "audio": {
-                "date": _preparation_date,
-                "audio_url": f"/episodes/noctua-{_preparation_date}.prep.mp3",
+                "date": state.preparation_date,
+                "audio_url": f"{ep_url_prefix}/noctua-{state.preparation_date}.prep.mp3",
                 "file_size_bytes": prep_mp3.stat().st_size if has_mp3 else 0,
             } if has_mp3 else None,
         }
@@ -429,9 +478,10 @@ async def api_latest_episode():
 
 
 @app.get("/api/episodes")
-async def api_episodes():
+async def api_episodes(show_id: str = Query(default="")):
     """Get the full archive of all episodes ever published."""
-    episodes = database.list_episodes()
+    state = _resolve_show(show_id)
+    episodes = database.list_episodes(db_path=state.show.db_path)
     return JSONResponse({"episodes": episodes, "total": len(episodes)})
 
 
@@ -439,42 +489,32 @@ async def api_episodes():
 async def api_topic_coverage(
     mode: str = Query("cumulative"),
     published_only: bool = Query(False),
+    show_id: str = Query(default=""),
 ):
-    """Radar chart data: target vs actual topic coverage with suggestions.
+    """Radar chart data: target vs actual topic coverage."""
+    state = _resolve_show(show_id)
+    db_path = state.show.db_path
 
-    Each topic's target is 100% (its full allocated time). Actual is the
-    percentage of that allocation covered, based on article counts.
-
-    Args:
-        mode: "cumulative" for all digests, "latest" for most recent only.
-        published_only: If True, only include digests with published episodes.
-    """
     from src.topic_classifier import SEGMENT_DURATIONS, SEGMENT_ORDER
 
-    # Parse allocated minutes per topic
     duration_map = {}
     for topic, dur_str in SEGMENT_DURATIONS.items():
         minutes = int(dur_str.replace("~", "").replace(" minutes", "").replace(" minute", ""))
         duration_map[topic.value] = minutes
-    total_minutes = sum(duration_map.values())
 
-    # Actual coverage from recent digests
-    # When preparation is active, use the in-memory digest:
-    #   - mode=latest: show only the new digest
-    #   - mode=cumulative: include the new digest alongside DB digests
     prep_digest_data = None
-    if _preparation_active and _preparation_digest and not published_only:
+    if state.preparation_active and state.preparation_digest and not published_only:
         prep_digest_data = {
-            "date": _preparation_digest.date,
-            "segment_counts": _preparation_digest.segment_counts or {},
-            "segment_sources": _preparation_digest.segment_sources or {},
+            "date": state.preparation_digest.date,
+            "segment_counts": state.preparation_digest.segment_counts or {},
+            "segment_sources": state.preparation_digest.segment_sources or {},
         }
 
     if mode == "latest" and prep_digest_data:
         digests = [prep_digest_data]
     else:
         limit = 1 if mode == "latest" else 30
-        digests = database.get_topic_coverage(limit=limit, published_only=published_only)
+        digests = database.get_topic_coverage(limit=limit, published_only=published_only, db_path=db_path)
         if mode == "cumulative" and prep_digest_data:
             digests = [prep_digest_data] + digests
 
@@ -490,28 +530,20 @@ async def api_topic_coverage(
     grand_total = sum(totals.values())
     has_data = grand_total > 0
 
-    # Per-topic actual as % of segment capacity filled.
-    # Capacity = max(2, round(mins * 1.5)) articles — same cap used in the digest compiler.
-    # The radar is capped at 100% (content is hard-capped in the digest).
-    # But we track the raw incoming count to detect over-coverage (wasted sources).
     num_digests = max(len(digests), 1)
     topics = []
     for topic in SEGMENT_ORDER:
         name = topic.value
         mins = duration_map.get(name, 1)
-        capacity = max(2, round(mins * 1.5))  # matches digest_compiler capping
+        capacity = max(2, round(mins * 1.5))
         actual_articles = totals.get(name, 0)
         if has_data:
-            # Average articles per digest for this segment
             avg_articles = actual_articles / num_digests
-            # Radar display: capped at 100%
             actual_pct = min(avg_articles / capacity, 1.0) * 100
-            # Raw ratio: how much is actually coming in vs capacity (can exceed 100%)
             raw_pct = (avg_articles / capacity) * 100
         else:
             actual_pct = 0
             raw_pct = 0
-        # Label includes allocated minutes
         label = f"{name} ({mins}m)"
         topics.append({
             "name": label,
@@ -523,7 +555,6 @@ async def api_topic_coverage(
             "capacity": capacity,
         })
 
-    # Suggestions based on raw incoming coverage
     suggestions = []
     if has_data:
         for topic_enum, t in zip(SEGMENT_ORDER, topics):
@@ -553,19 +584,24 @@ async def api_topic_coverage(
 
 
 @app.get("/api/history")
-async def api_history():
+async def api_history(show_id: str = Query(default="")):
     """Combined digest + episode history for the History tab."""
-    digests = database.list_digests(limit=100)
-    episodes_list = database.list_episodes()
+    state = _resolve_show(show_id)
+    show = state.show
+    db_path = show.db_path
+    episodes_dir = show.episodes_dir
+    is_legacy = show.output_dir == Path("output")
+
+    digests = database.list_digests(limit=100, db_path=db_path)
+    episodes_list = database.list_episodes(db_path=db_path)
     ep_by_date = {ep["date"]: ep for ep in episodes_list}
 
     rows = []
     for d in digests:
         ep = ep_by_date.get(d["date"])
-        full = database.get_digest(d["date"])
-        # Audio is only available if there's a GCS URL or the local file exists
+        full = database.get_digest(d["date"], db_path=db_path)
         gcs_url = ep.get("gcs_url", "") if ep else ""
-        local_file = EPISODES_DIR / f"noctua-{d['date']}.mp3"
+        local_file = episodes_dir / f"noctua-{d['date']}.mp3"
         has_audio = bool(gcs_url) or local_file.exists()
         rows.append({
             "date": d["date"],
@@ -573,7 +609,6 @@ async def api_history():
             "total_words": d["total_words"],
             "total_chars": len(full["markdown_text"]) if full else 0,
             "email_count": d.get("email_count", 0),
-            "tweet_count": d.get("tweet_count", 0),
             "topics_summary": d["topics_summary"],
             "has_digest": True,
             "has_audio": has_audio,
@@ -587,20 +622,24 @@ async def api_history():
 
 
 @app.get("/api/export-episodes")
-async def api_export_episodes():
+async def api_export_episodes(show_id: str = Query(default="")):
     """Bundle the current PST week's episode MP3s into a ZIP for download."""
-    if not EPISODES_DIR.exists():
+    state = _resolve_show(show_id)
+    show = state.show
+    episodes_dir = show.episodes_dir
+    exports_dir = show.exports_dir
+
+    if not episodes_dir.exists():
         return JSONResponse({"error": "No episodes directory found."}, status_code=404)
 
     now = _pst_now()
     mon, sun = _week_date_range(now)
     week_label = _iso_week_label(now)
 
-    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    zip_name = f"hootline-{week_label}.zip"
-    zip_path = EXPORTS_DIR / zip_name
+    exports_dir.mkdir(parents=True, exist_ok=True)
+    zip_name = f"{show.show_id}-{week_label}.zip"
+    zip_path = exports_dir / zip_name
 
-    # Serve cached ZIP if it already exists for this week
     if zip_path.exists():
         return FileResponse(
             zip_path,
@@ -609,7 +648,7 @@ async def api_export_episodes():
         )
 
     mp3_files = sorted(
-        mp3 for mp3 in EPISODES_DIR.glob("noctua-*.mp3")
+        mp3 for mp3 in episodes_dir.glob("noctua-*.mp3")
         if mon <= mp3.stem.removeprefix("noctua-") <= sun
     )
     if not mp3_files:
@@ -618,7 +657,7 @@ async def api_export_episodes():
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zf:
         for mp3 in mp3_files:
             zf.write(mp3, mp3.name)
-        _add_digests_to_zip(zf, mon, sun)
+        _add_digests_to_zip(zf, mon, sun, db_path=show.db_path)
 
     return FileResponse(
         zip_path,
@@ -628,15 +667,18 @@ async def api_export_episodes():
 
 
 @app.get("/api/export-weeks")
-async def api_export_weeks():
+async def api_export_weeks(show_id: str = Query(default="")):
     """List all pending (un-downloaded) weekly ZIPs."""
-    if not EXPORTS_DIR.exists():
+    state = _resolve_show(show_id)
+    exports_dir = state.show.exports_dir
+    prefix = state.show.show_id
+
+    if not exports_dir.exists():
         return JSONResponse([])
-    zips = sorted(EXPORTS_DIR.glob("hootline-W*.zip"))
+    zips = sorted(exports_dir.glob(f"{prefix}-W*.zip"))
     result = []
     for z in zips:
-        # Extract week label from filename: hootline-W08-2026.zip -> W08-2026
-        label = z.stem.removeprefix("hootline-")
+        label = z.stem.removeprefix(f"{prefix}-")
         stat = z.stat()
         created = datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat()
         result.append({
@@ -649,16 +691,16 @@ async def api_export_weeks():
 
 
 @app.get("/api/download-export/{filename}")
-async def api_download_export(filename: str):
-    """Download a specific weekly ZIP and delete it afterward (marks as downloaded)."""
+async def api_download_export(filename: str, show_id: str = Query(default="")):
+    """Download a specific weekly ZIP and delete it afterward."""
     if ".." in filename or "/" in filename:
         return Response(content="Invalid filename.", status_code=400)
 
-    zip_path = EXPORTS_DIR / filename
+    state = _resolve_show(show_id)
+    zip_path = state.show.exports_dir / filename
     if not zip_path.exists():
         return JSONResponse({"error": "Export not found."}, status_code=404)
 
-    # Read into memory so we can delete the file after sending
     content = zip_path.read_bytes()
     zip_path.unlink()
     logger.info("Served and deleted export: %s", filename)
@@ -670,12 +712,33 @@ async def api_download_export(filename: str):
     )
 
 
+# --- Digest downloads ---
+
 @app.get("/digests/{date}.md")
-async def digest_download(date: str) -> Response:
-    """Serve a digest as a downloadable .md file."""
+async def digest_download(date: str, show_id: str = Query(default="")) -> Response:
+    """Serve a digest as a downloadable .md file (legacy route)."""
     if ".." in date or "/" in date:
         return Response(content="Invalid date.", status_code=400)
-    digest = database.get_digest(date)
+    state = _resolve_show(show_id)
+    digest = database.get_digest(date, db_path=state.show.db_path)
+    if not digest:
+        return Response(content="Digest not found.", status_code=404)
+    return Response(
+        content=digest["markdown_text"],
+        media_type="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="noctua-digest-{date}.md"'},
+    )
+
+
+@app.get("/{show_id}/digests/{date}.md")
+async def show_digest_download(show_id: str, date: str) -> Response:
+    """Serve a show-specific digest as a downloadable .md file."""
+    if ".." in date or "/" in date:
+        return Response(content="Invalid date.", status_code=400)
+    if show_id not in _show_states:
+        return Response(content="Show not found.", status_code=404)
+    state = _show_states[show_id]
+    digest = database.get_digest(date, db_path=state.show.db_path)
     if not digest:
         return Response(content="Digest not found.", status_code=404)
     return Response(
@@ -689,16 +752,45 @@ async def digest_download(date: str) -> Response:
 
 @app.get("/feed.xml")
 async def feed() -> Response:
-    """Serve the RSS podcast feed."""
-    if not FEED_PATH.exists():
+    """Serve the RSS podcast feed (default show, backward compat)."""
+    state = _resolve_show("")
+    feed_path = state.show.feed_path
+    if not feed_path.exists():
         return Response(content="Feed not yet generated.", status_code=404)
-    return FileResponse(FEED_PATH, media_type="application/rss+xml")
+    return FileResponse(feed_path, media_type="application/rss+xml")
+
+
+@app.get("/{show_id}/feed.xml")
+async def show_feed(show_id: str) -> Response:
+    """Serve a show-specific RSS podcast feed."""
+    if show_id not in _show_states:
+        return Response(content="Show not found.", status_code=404)
+    state = _show_states[show_id]
+    feed_path = state.show.feed_path
+    if not feed_path.exists():
+        return Response(content="Feed not yet generated.", status_code=404)
+    return FileResponse(feed_path, media_type="application/rss+xml")
 
 
 @app.get("/episodes/{filename}")
 async def episode(filename: str, request: Request) -> Response:
+    """Serve an episode MP3 file (default show, backward compat)."""
+    state = _resolve_show("")
+    return _serve_episode(state.show.episodes_dir, filename, request)
+
+
+@app.get("/{show_id}/episodes/{filename}")
+async def show_episode(show_id: str, filename: str, request: Request) -> Response:
+    """Serve a show-specific episode MP3 file."""
+    if show_id not in _show_states:
+        return Response(content="Show not found.", status_code=404)
+    state = _show_states[show_id]
+    return _serve_episode(state.show.episodes_dir, filename, request)
+
+
+def _serve_episode(episodes_dir: Path, filename: str, request: Request) -> Response:
     """Serve an episode MP3 file with range request support."""
-    file_path = EPISODES_DIR / filename
+    file_path = episodes_dir / filename
 
     if ".." in filename or "/" in filename:
         return Response(content="Invalid filename.", status_code=400)
@@ -747,25 +839,28 @@ async def episode(filename: str, request: Request) -> Response:
     )
 
 
+# --- Generation & Preparation ---
+
 @app.post("/api/generate")
-async def api_generate():
-    """Manually trigger digest preparation (steps 1-3)."""
-    if _generation_lock.locked():
+async def api_generate(show_id: str = Query(default="")):
+    """Manually trigger digest preparation."""
+    state = _resolve_show(show_id)
+
+    if state.generation_lock.locked():
         return JSONResponse(
             {"status": "already_running", "message": "Digest preparation is already in progress."},
             status_code=409,
         )
 
-    asyncio.create_task(_run_generation())
+    asyncio.create_task(_run_generation(state))
     return JSONResponse({"status": "started", "message": "Digest preparation started."})
 
 
 @app.get("/api/cron/generate")
-async def api_cron_generate(secret: str = Query("")):
+async def api_cron_generate(secret: str = Query(""), show_id: str = Query(default="")):
     """External cron trigger for daily digest generation.
 
-    Call this from an external cron service (e.g. cron-job.org) at the
-    configured generation time. Requires the CRON_SECRET query parameter.
+    When show_id is omitted, triggers all shows. When provided, triggers only that show.
     """
     if not settings.cron_secret:
         return JSONResponse(
@@ -775,42 +870,59 @@ async def api_cron_generate(secret: str = Query("")):
     if secret != settings.cron_secret:
         return JSONResponse({"error": "Invalid secret."}, status_code=403)
 
-    if _generation_lock.locked():
-        return JSONResponse(
-            {"status": "already_running", "message": "Digest preparation is already in progress."},
-            status_code=409,
-        )
+    if show_id:
+        if show_id not in _show_states:
+            return JSONResponse({"error": f"Unknown show: {show_id}"}, status_code=404)
+        state = _show_states[show_id]
+        if state.generation_lock.locked():
+            return JSONResponse(
+                {"status": "already_running", "message": f"Generation already in progress for {show_id}."},
+                status_code=409,
+            )
+        logger.info("Cron trigger: starting generation for %s.", show_id)
+        asyncio.create_task(_run_generation(state))
+        return JSONResponse({"status": "started", "message": f"Generation started for {show_id} via cron."})
 
-    logger.info("Cron trigger: starting digest generation.")
-    asyncio.create_task(_run_generation())
-    return JSONResponse({"status": "started", "message": "Digest preparation started via cron."})
+    # Trigger all shows
+    started = []
+    skipped = []
+    for sid, state in _show_states.items():
+        if state.generation_lock.locked():
+            skipped.append(sid)
+        else:
+            asyncio.create_task(_run_generation(state))
+            started.append(sid)
+
+    logger.info("Cron trigger: started=%s, skipped=%s", started, skipped)
+    return JSONResponse({
+        "status": "started",
+        "message": f"Generation started via cron.",
+        "started": started,
+        "skipped": skipped,
+    })
 
 
 @app.post("/api/start-preparation")
-async def api_start_preparation():
-    """Start the preparation workflow: generate a new digest (always).
-
-    Existing episode/digest in History and RSS are untouched until Publish.
-    The new digest is held in memory only.
-    """
-    global _preparation_active, _preparation_date, _preparation_cancelled, _preparation_digest, _preparation_error
+async def api_start_preparation(show_id: str = Query(default="")):
+    """Start the preparation workflow: generate a new digest."""
+    state = _resolve_show(show_id)
 
     today_str = datetime.now(PST).strftime("%Y-%m-%d")
 
-    _preparation_cancelled = False
-    _preparation_active = True
-    _preparation_date = today_str
-    _preparation_digest = None
-    _preparation_error = None
+    state.preparation_cancelled = False
+    state.preparation_active = True
+    state.preparation_date = today_str
+    state.preparation_digest = None
+    state.preparation_error = None
 
-    if _generation_lock.locked():
+    if state.generation_lock.locked():
         return JSONResponse({
             "state": "generating",
             "date": today_str,
             "message": "Generation already in progress.",
         })
 
-    asyncio.create_task(_run_generation())
+    asyncio.create_task(_run_generation(state))
     return JSONResponse({
         "state": "generating",
         "date": today_str,
@@ -819,44 +931,38 @@ async def api_start_preparation():
 
 
 @app.get("/api/preparation-digest")
-async def api_preparation_digest():
+async def api_preparation_digest(show_id: str = Query(default="")):
     """Serve the in-memory preparation digest as a downloadable .md file."""
-    if not _preparation_digest:
+    state = _resolve_show(show_id)
+    if not state.preparation_digest:
         return Response(content="No preparation digest available.", status_code=404)
     return Response(
-        content=_preparation_digest.text,
+        content=state.preparation_digest.text,
         media_type="text/markdown",
-        headers={"Content-Disposition": f'attachment; filename="noctua-digest-{_preparation_digest.date}.md"'},
+        headers={"Content-Disposition": f'attachment; filename="noctua-digest-{state.preparation_digest.date}.md"'},
     )
 
 
 @app.post("/api/publish-episode")
-async def api_publish_episode(date: str = Form("")):
-    """Publish a prepared episode to RSS and archive.
-
-    Saves the in-memory preparation digest to DB (with force to bypass
-    episode lock), then processes the prep MP3 and publishes to RSS.
-    """
-    global _preparation_active, _preparation_digest
+async def api_publish_episode(date: str = Form(""), show_id: str = Form("")):
+    """Publish a prepared episode to RSS and archive."""
+    state = _resolve_show(show_id)
+    show = state.show
 
     if not date or not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
         return JSONResponse({"error": "Invalid date format."}, status_code=400)
 
-    # Use the in-memory preparation digest
-    if not _preparation_digest or _preparation_digest.date != date:
+    if not state.preparation_digest or state.preparation_digest.date != date:
         return JSONResponse({"error": "No preparation digest available for this date."}, status_code=404)
 
-    # Verify prep MP3 exists on disk
-    prep_mp3 = EPISODES_DIR / f"noctua-{date}.prep.mp3"
+    prep_mp3 = show.episodes_dir / f"noctua-{date}.prep.mp3"
     if not prep_mp3.exists():
         return JSONResponse({"error": f"No uploaded audio found for {date}."}, status_code=404)
 
-    # Rename prep MP3 to canonical name (overwrites old episode MP3)
-    mp3_path = EPISODES_DIR / f"noctua-{date}.mp3"
+    mp3_path = show.episodes_dir / f"noctua-{date}.mp3"
     prep_mp3.rename(mp3_path)
 
-    # Save the preparation digest to DB (force bypasses episode lock)
-    digest = _preparation_digest
+    digest = state.preparation_digest
     database.save_digest(
         date=digest.date,
         markdown_text=digest.text,
@@ -867,33 +973,36 @@ async def api_publish_episode(date: str = Form("")):
         segment_counts=digest.segment_counts,
         segment_sources=digest.segment_sources,
         force=True,
+        db_path=show.db_path,
     )
 
-    # Process episode (validate MP3, extract metadata, GCS upload, cleanup)
     try:
-        metadata = episode_manager.process(mp3_path, digest.topics_summary, digest.rss_summary)
+        metadata = episode_manager.process(mp3_path, digest.topics_summary, digest.rss_summary, show=show)
     except Exception as e:
         return JSONResponse(
             {"error": f"Episode processing failed: {e}"},
             status_code=422,
         )
 
-    # Publish to RSS feed + archive to DB
     try:
-        feed_builder.add_episode(metadata)
+        feed_builder.add_episode(metadata, show=show)
     except Exception as e:
         return JSONResponse(
             {"error": f"Feed update failed: {e}"},
             status_code=500,
         )
 
-    _preparation_active = False
-    _preparation_digest = None
+    state.preparation_active = False
+    state.preparation_digest = None
+
+    # Determine feed URL
+    is_legacy = show.output_dir == Path("output")
+    feed_url = f"{settings.base_url}/feed.xml" if is_legacy else f"{settings.base_url}/{show.show_id}/feed.xml"
 
     return JSONResponse({
         "status": "ok",
         "message": f"Episode for {date} published to RSS.",
-        "feed_url": f"{settings.base_url}/feed.xml",
+        "feed_url": feed_url,
         "episode": {
             "date": metadata.date,
             "duration_formatted": metadata.duration_formatted,
@@ -905,55 +1014,51 @@ async def api_publish_episode(date: str = Form("")):
 
 
 @app.post("/api/bump-revision")
-async def api_bump_revision(date: str = Form("")):
-    """Bump the revision for an episode to force podcast apps to re-download."""
+async def api_bump_revision(date: str = Form(""), show_id: str = Form("")):
+    """Bump the revision for an episode."""
+    state = _resolve_show(show_id)
     if not date or not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
         return JSONResponse({"error": "Invalid date format."}, status_code=400)
-    new_rev = feed_builder.bump_revision(date)
+    new_rev = feed_builder.bump_revision(date, show=state.show)
     return JSONResponse({"status": "ok", "date": date, "revision": new_rev})
 
 
 @app.post("/api/cancel-preparation")
-async def api_cancel_preparation():
-    """Cancel the preparation workflow.
+async def api_cancel_preparation(show_id: str = Query(default="")):
+    """Cancel the preparation workflow."""
+    state = _resolve_show(show_id)
 
-    Only discards in-memory digest and prep MP3.
-    Existing episode/digest in DB and RSS are untouched.
-    """
-    global _preparation_active, _preparation_cancelled, _preparation_date, _preparation_digest, _preparation_error
+    if state.generation_running:
+        state.preparation_cancelled = True
+        logger.info("[%s] Preparation cancel requested.", state.show.show_id)
 
-    if _generation_running:
-        _preparation_cancelled = True
-        logger.info("Preparation cancel requested — will discard after generation completes.")
-
-    # Delete only the prep MP3 (old canonical MP3 is untouched)
-    if _preparation_date:
-        prep_mp3 = EPISODES_DIR / f"noctua-{_preparation_date}.prep.mp3"
+    if state.preparation_date:
+        prep_mp3 = state.show.episodes_dir / f"noctua-{state.preparation_date}.prep.mp3"
         prep_mp3.unlink(missing_ok=True)
 
-    _preparation_active = False
-    _preparation_date = None
-    _preparation_digest = None
-    _preparation_error = None
+    state.preparation_active = False
+    state.preparation_date = None
+    state.preparation_digest = None
+    state.preparation_error = None
 
     return JSONResponse({"status": "ok", "message": "Preparation cancelled."})
 
 
 @app.post("/api/upload-episode")
-async def api_upload_episode(file: UploadFile, date: str = Form("")):
-    """Upload audio for a given digest date (preview only, no publishing).
+async def api_upload_episode(file: UploadFile, date: str = Form(""), show_id: str = Form("")):
+    """Upload audio for a given digest date (preview only, no publishing)."""
+    state = _resolve_show(show_id)
+    show = state.show
+    episodes_dir = show.episodes_dir
+    is_legacy = show.output_dir == Path("output")
+    ep_url_prefix = "/episodes" if is_legacy else f"/{show.show_id}/episodes"
 
-    During preparation, saves as .prep.mp3 so the existing episode MP3
-    is not overwritten until Publish.
-    """
-    # Validate date format
     if not date or not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
         return JSONResponse(
             {"error": "Invalid date format. Use YYYY-MM-DD."},
             status_code=400,
         )
 
-    # Validate the date is a real date
     try:
         datetime.strptime(date, "%Y-%m-%d")
     except ValueError:
@@ -962,15 +1067,14 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
             status_code=400,
         )
 
-    # Check that a digest is available (either in memory during prep or in DB)
-    has_digest = (_preparation_digest and _preparation_digest.date == date) or database.get_digest(date) is not None
+    has_digest = (state.preparation_digest and state.preparation_digest.date == date) or \
+                 database.get_digest(date, db_path=show.db_path) is not None
     if not has_digest:
         return JSONResponse(
             {"error": f"No digest found for {date}. Prepare a digest first."},
             status_code=404,
         )
 
-    # Validate file extension
     if not file.filename:
         return JSONResponse({"error": "No file provided."}, status_code=400)
     ext = Path(file.filename).suffix.lower()
@@ -980,10 +1084,9 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
             status_code=400,
         )
 
-    # Save to .prep.mp3 during preparation so existing episode MP3 stays intact
-    EPISODES_DIR.mkdir(parents=True, exist_ok=True)
-    mp3_path = EPISODES_DIR / f"noctua-{date}.prep.mp3"
-    upload_path = EPISODES_DIR / f"noctua-{date}.prep{ext}"
+    episodes_dir.mkdir(parents=True, exist_ok=True)
+    mp3_path = episodes_dir / f"noctua-{date}.prep.mp3"
+    upload_path = episodes_dir / f"noctua-{date}.prep{ext}"
     try:
         contents = await file.read()
         if len(contents) == 0:
@@ -998,7 +1101,6 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
             status_code=500,
         )
 
-    # Convert to MP3 if needed
     if ext != ".mp3":
         try:
             logger.info("Converting %s (%d bytes) to MP3...", upload_path.name, upload_path.stat().st_size)
@@ -1031,7 +1133,6 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
                 status_code=500,
             )
 
-    # Validate MP3 and extract metadata (no publishing)
     try:
         from src.episode_manager import _ensure_mp3, _format_duration
         mp3_path = _ensure_mp3(mp3_path)
@@ -1056,34 +1157,41 @@ async def api_upload_episode(file: UploadFile, date: str = Form("")):
             "duration_formatted": duration_formatted,
             "duration_seconds": duration_seconds,
             "file_size_bytes": file_size_bytes,
-            "audio_url": f"/episodes/noctua-{date}.prep.mp3",
+            "audio_url": f"{ep_url_prefix}/noctua-{date}.prep.mp3",
         },
     })
 
 
 @app.get("/health")
 async def health() -> dict:
-    """Health check endpoint — kept lightweight for fast deployment health checks."""
+    """Health check endpoint."""
+    any_running = any(s.generation_running for s in _show_states.values())
     return {
         "status": "ok",
-        "generation_running": _generation_running,
+        "generation_running": any_running,
         "next_scheduled_run": _next_scheduled_run.isoformat() if _next_scheduled_run else None,
         "generation_schedule_utc": f"{settings.generation_hour:02d}:{settings.generation_minute:02d}",
+        "shows": list(_show_states.keys()),
     }
 
 
 @app.get("/health/detail")
 async def health_detail() -> dict:
     """Detailed health check with file system and database stats."""
-    episode_count = len(list(EPISODES_DIR.glob("noctua-*.mp3"))) if EPISODES_DIR.exists() else 0
-    feed_exists = FEED_PATH.exists()
-    digest_count = len(database.list_digests())
+    show_details = {}
+    for sid, state in _show_states.items():
+        show = state.show
+        ep_count = len(list(show.episodes_dir.glob("noctua-*.mp3"))) if show.episodes_dir.exists() else 0
+        show_details[sid] = {
+            "episodes": ep_count,
+            "digests": len(database.list_digests(db_path=show.db_path)),
+            "feed_exists": show.feed_path.exists(),
+            "generation_running": state.generation_running,
+        }
+
     return {
         "status": "ok",
-        "episodes": episode_count,
-        "digests": digest_count,
-        "feed_exists": feed_exists,
-        "generation_running": _generation_running,
+        "shows": show_details,
         "next_scheduled_run": _next_scheduled_run.isoformat() if _next_scheduled_run else None,
         "generation_schedule_utc": f"{settings.generation_hour:02d}:{settings.generation_minute:02d}",
         "ffmpeg": _ffmpeg_path(),
@@ -1093,6 +1201,20 @@ async def health_detail() -> dict:
 
 # --- Dashboard HTML ---
 
+def _build_dashboard_html(show_id: str = "") -> str:
+    """Build the dashboard HTML with the given show_id baked in."""
+    # Determine show title for the header
+    if show_id and show_id in _show_states:
+        title = _show_states[show_id].show.podcast_title
+    else:
+        # Default show
+        default_state = _resolve_show("")
+        title = default_state.show.podcast_title
+        show_id = default_state.show.show_id
+
+    return DASHBOARD_HTML.replace("__SHOW_ID__", show_id).replace("__SHOW_TITLE__", title)
+
+
 DASHBOARD_HTML = """\
 <!DOCTYPE html>
 <html lang="en">
@@ -1100,7 +1222,7 @@ DASHBOARD_HTML = """\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/png" href="/static/favicon.png">
-<title>The Hootline</title>
+<title>__SHOW_TITLE__</title>
 <style>
   :root {
     --bg: #0f1117;
@@ -1146,6 +1268,15 @@ DASHBOARD_HTML = """\
   .btn:hover { background: var(--accent-dim); color: var(--bg); }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .btn:disabled:hover { background: transparent; color: var(--accent); }
+
+  /* Show switcher */
+  .show-switcher { display: flex; gap: 4px; margin-left: 12px; }
+  .show-switcher a {
+    font-size: 10px; color: var(--text-dim); text-decoration: none;
+    padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border);
+  }
+  .show-switcher a:hover { color: var(--text); border-color: var(--text-dim); }
+  .show-switcher a.active { color: var(--accent); border-color: var(--accent-dim); background: rgba(196,160,82,0.1); }
 
   /* Tabs */
   .tab-bar { display: flex; border-bottom: 1px solid var(--border); padding: 0 24px; }
@@ -1261,14 +1392,17 @@ DASHBOARD_HTML = """\
 <body>
 
 <header>
-  <div>
-    <h1>THE HOOTLINE</h1>
-    <div class="tagline">The owl of Minerva spreads its wings only with the falling of dusk.</div>
+  <div style="display:flex;align-items:center;gap:12px;">
+    <div>
+      <h1 id="show-title">__SHOW_TITLE__</h1>
+      <div class="tagline">The owl of Minerva spreads its wings only with the falling of dusk.</div>
+    </div>
+    <div class="show-switcher" id="show-switcher"></div>
   </div>
   <div class="actions">
     <span style="font-size:10px;color:var(--text-dim);" id="sched-info"></span>
     <button class="btn" id="gen-btn" onclick="startPrep()">Prepare Digest</button>
-    <a class="btn" href="/feed.xml">RSS Feed</a>
+    <a class="btn" id="feed-link" href="/feed.xml">RSS Feed</a>
   </div>
 </header>
 
@@ -1296,7 +1430,34 @@ DASHBOARD_HTML = """\
 </div>
 
 <script>
+const SHOW_ID = '__SHOW_ID__';
+const SHOW_TITLE = '__SHOW_TITLE__';
 let radarMode = 'latest';
+
+// Helper to append show_id query parameter
+function apiUrl(path, extraParams) {
+  const sep = path.includes('?') ? '&' : '?';
+  let url = path + sep + 'show_id=' + encodeURIComponent(SHOW_ID);
+  if (extraParams) url += '&' + extraParams;
+  return url;
+}
+
+// Load show switcher
+async function loadShowSwitcher() {
+  try {
+    const res = await fetch('/api/shows');
+    const shows = await res.json();
+    if (shows.length <= 1) return;
+    const box = document.getElementById('show-switcher');
+    let h = '';
+    for (const s of shows) {
+      const href = s.id === shows[0].id ? '/' : '/' + s.id + '/';
+      const cls = s.id === SHOW_ID ? 'active' : '';
+      h += '<a href="' + href + '" class="' + cls + '">' + esc(s.title) + '</a>';
+    }
+    box.innerHTML = h;
+  } catch(e) {}
+}
 
 function switchTab(tab) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -1326,7 +1487,7 @@ function segmentCard() {
   // Intro
   s += '<div style="font-size:11px;color:var(--text-dim);margin-top:6px;padding:6px 8px;background:rgba(255,255,255,0.03);border-radius:4px;">';
   s += '<span style="color:var(--gold);font-weight:600;">Intro (~1 min)</span><br>';
-  s += 'Welcome to The Hootline, your daily knowledge briefing. Let\\'s dive in.';
+  s += 'Welcome to ' + esc(SHOW_TITLE) + ', your daily knowledge briefing. Let\\'s dive in.';
   s += '</div>';
   // Segments
   s += '<div style="display:grid;grid-template-columns:1fr auto;gap:2px 12px;font-size:11px;margin-top:8px;">';
@@ -1340,7 +1501,7 @@ function segmentCard() {
   // Outro
   s += '<div style="font-size:11px;color:var(--text-dim);margin-top:8px;padding:6px 8px;background:rgba(255,255,255,0.03);border-radius:4px;">';
   s += '<span style="color:var(--gold);font-weight:600;">Outro (~1 min)</span><br>';
-  s += 'That\\'s all for today\\'s Hootline. Thanks for listening — we\\'ll be back tomorrow with more. Until then, stay curious.';
+  s += 'That\\'s all for today\\'s ' + esc(SHOW_TITLE) + '. Thanks for listening — we\\'ll be back tomorrow with more. Until then, stay curious.';
   s += '</div>';
   // Total
   s += '<div style="display:grid;grid-template-columns:1fr auto;gap:0 12px;font-size:11px;margin-top:8px;border-top:1px solid var(--border);padding-top:6px;">';
@@ -1395,7 +1556,7 @@ function topicBreakdown(d) {
 async function loadLatest() {
   let res, data;
   try {
-    res = await fetch('/api/latest-episode');
+    res = await fetch(apiUrl('/api/latest-episode'));
     data = await res.json();
   } catch(e) {
     console.error('loadLatest fetch error:', e);
@@ -1427,7 +1588,7 @@ async function loadLatest() {
   if (data.digest) {
     const d = data.digest;
     h += '<div class="card"><div class="card-label">Today\\'s Digest</div><div class="digest-row"><div>';
-    h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + (d.email_count||0) + ' emails &middot; ' + (d.tweet_count||0) + ' tweets &middot; ' + d.total_words.toLocaleString() + ' words</div>';
+    h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + (d.email_count||0) + ' emails &middot; ' + d.total_words.toLocaleString() + ' words</div>';
     h += '<div class="digest-topics">' + esc(d.topics_summary||'') + '</div>';
     h += '</div><a class="dl-btn" href="' + d.download_url + '" download>Download .md</a></div></div>';
     h += topicBreakdown(d);
@@ -1439,7 +1600,7 @@ async function loadLatest() {
     const dd = dt.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
     const mb = (ep.file_size_bytes / 1048576).toFixed(1);
     h += '<div class="card"><div class="card-label">Latest Episode</div>';
-    h += '<div class="ep-title">The Hootline &mdash; ' + esc(dd) + '</div>';
+    h += '<div class="ep-title">' + esc(SHOW_TITLE) + ' &mdash; ' + esc(dd) + '</div>';
     if (ep.rss_summary) h += '<div class="ep-desc">' + esc(ep.rss_summary) + '</div>';
     h += '<div class="ep-meta"><span>' + (ep.duration_formatted||'') + '</span><span>' + mb + ' MB</span><span>' + esc(ep.topics_summary||'') + '</span></div>';
     h += '<audio controls preload="metadata" src="' + ep.audio_url + '"></audio></div>';
@@ -1479,7 +1640,7 @@ function renderPreparation(prep) {
   if (prep.digest) {
     const d = prep.digest;
     h += '<div class="card"><div class="card-label">New Digest Ready</div><div class="digest-row"><div>';
-    h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + (d.email_count||0) + ' emails &middot; ' + (d.tweet_count||0) + ' tweets &middot; ' + d.total_words.toLocaleString() + ' words</div>';
+    h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + (d.email_count||0) + ' emails &middot; ' + d.total_words.toLocaleString() + ' words</div>';
     h += '<div class="digest-topics">' + esc(d.topics_summary||'') + '</div>';
     h += '</div><a class="dl-btn" href="' + d.download_url + '" download>Download .md</a></div></div>';
     h += topicBreakdown(d);
@@ -1523,7 +1684,7 @@ async function loadRadar(mode, containerId) {
   mode = mode || 'latest';
   const box = document.getElementById(containerId);
   try {
-    let tcUrl = '/api/topic-coverage?mode=' + mode;
+    let tcUrl = apiUrl('/api/topic-coverage', 'mode=' + mode);
     if (containerId === 'hist-radar') tcUrl += '&published_only=true';
     const res = await fetch(tcUrl);
     const data = await res.json();
@@ -1645,7 +1806,10 @@ function getWeekRange() {
 async function loadHistory() {
   const box = document.getElementById('hist-content');
   try {
-    const [histRes, weeksRes] = await Promise.all([fetch('/api/history'), fetch('/api/export-weeks')]);
+    const [histRes, weeksRes] = await Promise.all([
+      fetch(apiUrl('/api/history')),
+      fetch(apiUrl('/api/export-weeks')),
+    ]);
     const data = await histRes.json();
     const pendingWeeks = await weeksRes.json();
 
@@ -1659,7 +1823,7 @@ async function loadHistory() {
     let h = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px;">';
     h += '<span style="font-size:12px;color:var(--text-dim);">' + thisWeek.length + ' episodes this week &middot; ' + weekMB + ' MB</span>';
     if (thisWeek.length > 0) {
-      h += '<button class="btn" onclick="window.location=\\'/api/export-episodes\\'">Export This Week (ZIP)</button>';
+      h += '<button class="btn" onclick="window.location=\\'' + apiUrl('/api/export-episodes') + '\\'">Export This Week (ZIP)</button>';
     }
     h += '</div>';
 
@@ -1674,7 +1838,7 @@ async function loadHistory() {
         h += '<span style="font-size:12px;color:var(--text);">' + esc(w.week_label) + ' &middot; ' + mb + ' MB';
         if (ts) h += ' &middot; <span style="color:var(--text-dim);">' + esc(ts) + '</span>';
         h += '</span>';
-        h += '<a class="btn" href="/api/download-export/' + encodeURIComponent(w.filename) + '">Download</a>';
+        h += '<a class="btn" href="' + apiUrl('/api/download-export/' + encodeURIComponent(w.filename)) + '">Download</a>';
         h += '</div>';
       }
       h += '</div></div>';
@@ -1686,7 +1850,7 @@ async function loadHistory() {
       const dd = dt.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'});
 
       const digestC = r.has_digest
-        ? '<a class="h-link digest" href="/digests/'+r.date+'.md" download>Download</a>'
+        ? '<a class="h-link digest" href="/digests/'+r.date+'.md?show_id='+encodeURIComponent(SHOW_ID)+'" download>Download</a>'
         : '<span class="h-badge no">none</span>';
 
       let audioC;
@@ -1698,7 +1862,7 @@ async function loadHistory() {
       }
 
       const dDetail = r.has_digest
-        ? '<span class="h-detail">'+r.article_count+' articles &middot; '+(r.email_count||0)+' emails &middot; '+(r.tweet_count||0)+' tweets &middot; '+r.total_words.toLocaleString()+' words</span>'
+        ? '<span class="h-detail">'+r.article_count+' articles &middot; '+(r.email_count||0)+' emails &middot; '+r.total_words.toLocaleString()+' words</span>'
         : '<span class="h-detail">&mdash;</span>';
 
       let aDetail = '&mdash;';
@@ -1750,7 +1914,7 @@ async function startPrep() {
   _prepActive = true;
   btn.disabled = true; btn.textContent = 'Preparing...';
   try {
-    const res = await fetch('/api/start-preparation', {method:'POST'});
+    const res = await fetch(apiUrl('/api/start-preparation'), {method:'POST'});
     const data = await res.json();
     if (!res.ok) {
       _prepActive = false;
@@ -1772,7 +1936,7 @@ async function cancelPrep() {
   const btn = document.getElementById('gen-btn');
   btn.disabled = true; btn.textContent = 'Cancelling...';
   try {
-    await fetch('/api/cancel-preparation', {method:'POST'});
+    await fetch(apiUrl('/api/cancel-preparation'), {method:'POST'});
   } catch(e) {}
   _prepActive = false;
   loadLatest();
@@ -1784,7 +1948,7 @@ async function publishEp(date, hasExisting) {
   }
   const btn = event.target;
   btn.disabled = true; btn.textContent = 'Publishing...';
-  const form = new FormData(); form.append('date', date);
+  const form = new FormData(); form.append('date', date); form.append('show_id', SHOW_ID);
   try {
     const res = await fetch('/api/publish-episode', {method:'POST', body:form});
     const data = await res.json();
@@ -1807,7 +1971,7 @@ async function uploadEp(date) {
   if (!fi.files.length) { st.className='upload-status error'; st.textContent='Select a file first.'; return; }
   btn.disabled=true; btn.textContent='Uploading...';
   st.className='upload-status'; st.textContent='Uploading and processing...';
-  const form = new FormData(); form.append('file',fi.files[0]); form.append('date',date);
+  const form = new FormData(); form.append('file',fi.files[0]); form.append('date',date); form.append('show_id',SHOW_ID);
   try {
     const res = await fetch('/api/upload-episode',{method:'POST',body:form});
     const data = await res.json();
@@ -1837,6 +2001,7 @@ async function updateHealth() {
   } catch(e) {}
 }
 
+loadShowSwitcher();
 loadLatest();
 updateHealth();
 setInterval(updateHealth, 10000);

@@ -9,20 +9,23 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-from config import settings
+from config import ShowConfig, settings
 from src.exceptions import EmailFetchError
 from src.models import EmailMessage
 
 logger = logging.getLogger(__name__)
 
 
-def _get_gmail_service():
+def _get_gmail_service(show: ShowConfig | None = None):
     """Build and return an authenticated Gmail API service."""
-    if not settings.gmail_credentials_json or not settings.gmail_token_json:
+    creds_json = show.gmail_credentials_json if show else settings.gmail_credentials_json
+    token_json = show.gmail_token_json if show else settings.gmail_token_json
+
+    if not creds_json or not token_json:
         raise EmailFetchError("Gmail credentials or token not configured.")
 
     try:
-        token_data = json.loads(settings.gmail_token_json)
+        token_data = json.loads(token_json)
         creds = Credentials.from_authorized_user_info(token_data)
 
         if creds.expired and creds.refresh_token:
@@ -82,7 +85,7 @@ def _get_header(headers: list[dict], name: str) -> str:
     return ""
 
 
-def fetch_todays_emails() -> list[EmailMessage]:
+def fetch_todays_emails(show: ShowConfig | None = None) -> list[EmailMessage]:
     """Fetch newsletter emails for today's episode (24-hour window).
 
     Uses the configured generation schedule to compute a rolling 24-hour
@@ -90,10 +93,14 @@ def fetch_todays_emails() -> list[EmailMessage]:
     Epoch timestamps ensure precise boundaries with no overlap between
     consecutive digests.
 
+    Args:
+        show: Show-specific config for Gmail credentials and label.
+
     Returns:
         List of EmailMessage objects for today's newsletters.
     """
-    service = _get_gmail_service()
+    service = _get_gmail_service(show)
+    gmail_label = show.gmail_label if show else settings.gmail_label
 
     PST = timezone(timedelta(hours=-8))
     now_pst = datetime.now(PST)
@@ -114,8 +121,8 @@ def fetch_todays_emails() -> list[EmailMessage]:
     after_epoch = int(start_boundary.timestamp())
     before_epoch = int(now_pst.timestamp())
     query = f"after:{after_epoch} before:{before_epoch}"
-    if settings.gmail_label:
-        query = f"label:{settings.gmail_label} {query}"
+    if gmail_label:
+        query = f"label:{gmail_label} {query}"
 
     logger.info("Querying Gmail: %s", query)
 

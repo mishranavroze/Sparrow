@@ -10,13 +10,17 @@ packages = ["ffmpeg-full", "gitFull", "libxcrypt", "playwright-driver", "xcodebu
 localPort = 5000
 externalPort = 80
 
+[[ports]]
+localPort = 8000
+externalPort = 8000
+
 [env]
 PORT = "5000"
 
 [deployment]
-deploymentTarget = "static"
-run = ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5000"]
-build = ["bash", "-c", "playwright install chromium 2>/dev/null || true"]
+deploymentTarget = "autoscale"
+run = ["bash", "start.sh"]
+build = ["bash", "-c", "pip install -e . 2>/dev/null; playwright install chromium"]
 
 [workflows]
 runButton = "Project"

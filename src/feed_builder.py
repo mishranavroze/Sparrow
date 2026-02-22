@@ -7,37 +7,47 @@ from pathlib import Path
 
 from feedgen.feed import FeedGenerator
 
-from config import settings
+from config import ShowConfig, settings
 from src import database
 from src.exceptions import FeedBuildError
 from src.models import EpisodeMetadata
 
 logger = logging.getLogger(__name__)
 
-FEED_PATH = Path("output/feed.xml")
-EPISODES_JSON = Path("output/episodes.json")
+DEFAULT_FEED_PATH = Path("output/feed.xml")
+DEFAULT_EPISODES_JSON = Path("output/episodes.json")
 MAX_FEED_EPISODES = 30
-FALLBACK_RSS_DESCRIPTION = "Your nightly knowledge briefing from The Hootline."
+FALLBACK_RSS_DESCRIPTION = "Your nightly knowledge briefing."
 
 
-def _load_episode_catalog() -> list[dict]:
+def _resolve_paths(show: ShowConfig | None) -> tuple[Path, Path]:
+    """Return (feed_path, episodes_json) for the given show."""
+    if show:
+        return show.feed_path, show.episodes_json_path
+    return DEFAULT_FEED_PATH, DEFAULT_EPISODES_JSON
+
+
+def _load_episode_catalog(show: ShowConfig | None = None) -> list[dict]:
     """Load the episode catalog from disk."""
-    if EPISODES_JSON.exists():
-        return json.loads(EPISODES_JSON.read_text())
+    _, episodes_json = _resolve_paths(show)
+    if episodes_json.exists():
+        return json.loads(episodes_json.read_text())
     return []
 
 
-def _save_episode_catalog(episodes: list[dict]) -> None:
+def _save_episode_catalog(episodes: list[dict], show: ShowConfig | None = None) -> None:
     """Save the episode catalog to disk."""
-    EPISODES_JSON.parent.mkdir(parents=True, exist_ok=True)
-    EPISODES_JSON.write_text(json.dumps(episodes, indent=2))
+    _, episodes_json = _resolve_paths(show)
+    episodes_json.parent.mkdir(parents=True, exist_ok=True)
+    episodes_json.write_text(json.dumps(episodes, indent=2))
 
 
-def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
+def _build_feed_generator(episodes: list[dict], show: ShowConfig | None = None) -> FeedGenerator:
     """Create and configure a FeedGenerator with podcast extension.
 
     Args:
         episodes: List of episode metadata dicts.
+        show: Show-specific config for metadata and URLs.
 
     Returns:
         Configured FeedGenerator.
@@ -45,17 +55,30 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
     fg = FeedGenerator()
     fg.load_extension("podcast")
 
-    fg.title(settings.podcast_title)
-    fg.description(settings.podcast_description)
-    fg.link(href=f"{settings.base_url}/feed.xml", rel="self")
+    title = show.podcast_title if show else settings.podcast_title
+    description = show.podcast_description if show else settings.podcast_description
+    show_id = show.show_id if show else "hootline"
+
+    # In legacy mode (output_dir == "output"), use root URLs for backward compat
+    is_legacy = show and show.output_dir == Path("output")
+    if is_legacy:
+        feed_url = f"{settings.base_url}/feed.xml"
+        episode_url_prefix = f"{settings.base_url}/episodes"
+    else:
+        feed_url = f"{settings.base_url}/{show_id}/feed.xml"
+        episode_url_prefix = f"{settings.base_url}/{show_id}/episodes"
+
+    fg.title(title)
+    fg.description(description)
+    fg.link(href=feed_url, rel="self")
     fg.link(href=settings.base_url, rel="alternate")
     fg.language("en")
-    fg.generator("The Hootline Podcast Generator")
+    fg.generator(f"{title} Podcast Generator")
 
     # Channel-level image (standard RSS)
     fg.image(
         url=f"{settings.base_url}/static/noctua-owl.png",
-        title=settings.podcast_title,
+        title=title,
         link=settings.base_url,
     )
 
@@ -63,7 +86,7 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
     fg.podcast.itunes_category("News", "Daily News")
     fg.podcast.itunes_author("Aannesha Satpati")
     fg.podcast.itunes_explicit("no")
-    fg.podcast.itunes_summary(settings.podcast_description)
+    fg.podcast.itunes_summary(description)
     fg.podcast.itunes_owner(name="Aannesha Satpati", email="aannesha.satpati@gmail.com")
     fg.podcast.itunes_image(f"{settings.base_url}/static/noctua-owl.png")
 
@@ -76,7 +99,7 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
         if ep.get("gcs_url"):
             mp3_url = ep["gcs_url"]
         else:
-            mp3_url = f"{settings.base_url}/episodes/noctua-{ep['date']}.mp3?v={ep['file_size_bytes']}"
+            mp3_url = f"{episode_url_prefix}/noctua-{ep['date']}.mp3?v={ep['file_size_bytes']}"
 
         fe.id(mp3_url)
 
@@ -88,7 +111,8 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
             display_date = ep["date"]
 
         fe.title(display_date)
-        fe.description(ep.get("rss_summary") or FALLBACK_RSS_DESCRIPTION)
+        fallback = f"Your nightly knowledge briefing from {title}."
+        fe.description(ep.get("rss_summary") or fallback)
         fe.published(
             datetime.fromisoformat(ep["published"]) if "published" in ep
             else datetime.now(UTC)
@@ -99,20 +123,22 @@ def _build_feed_generator(episodes: list[dict]) -> FeedGenerator:
 
         # Podcast extensions
         fe.podcast.itunes_duration(ep.get("duration_formatted", "00:00:00"))
-        fe.podcast.itunes_summary(ep.get("rss_summary") or FALLBACK_RSS_DESCRIPTION)
+        fe.podcast.itunes_summary(ep.get("rss_summary") or fallback)
         fe.podcast.itunes_explicit("no")
 
     return fg
 
 
-def add_episode(metadata: EpisodeMetadata) -> None:
+def add_episode(metadata: EpisodeMetadata, show: ShowConfig | None = None) -> None:
     """Add a new episode to the podcast RSS feed.
 
     Args:
         metadata: Episode metadata (duration, size, path, summary).
+        show: Show-specific config for paths and metadata.
     """
+    db_path = show.db_path if show else None
     try:
-        episodes = _load_episode_catalog()
+        episodes = _load_episode_catalog(show)
 
         # Remove existing entry for the same date (re-generation)
         episodes = [e for e in episodes if e["date"] != metadata.date]
@@ -133,8 +159,8 @@ def add_episode(metadata: EpisodeMetadata) -> None:
         # Keep only the most recent episodes
         episodes = sorted(episodes, key=lambda e: e["date"], reverse=True)[:MAX_FEED_EPISODES]
 
-        _save_episode_catalog(episodes)
-        build_feed()
+        _save_episode_catalog(episodes, show)
+        build_feed(show)
 
         # Permanent archive (no limit)
         database.save_episode(
@@ -145,6 +171,7 @@ def add_episode(metadata: EpisodeMetadata) -> None:
             topics_summary=metadata.topics_summary,
             rss_summary=metadata.rss_summary,
             gcs_url=metadata.gcs_url,
+            db_path=db_path,
         )
 
         logger.info("Added episode for %s to feed", metadata.date)
@@ -153,18 +180,20 @@ def add_episode(metadata: EpisodeMetadata) -> None:
         raise FeedBuildError(f"Failed to add episode to feed: {e}") from e
 
 
-def sync_catalog_from_db() -> None:
+def sync_catalog_from_db(show: ShowConfig | None = None) -> None:
     """Rebuild episodes.json and feed.xml from the database.
 
     This ensures the RSS feed matches the database (source of truth)
     after deploys or manual DB edits. Preserves revision numbers from
     the existing catalog (used for cache-busting with podcast services).
     """
+    db_path = show.db_path if show else None
+
     # Preserve revision numbers from existing catalog
-    old_catalog = _load_episode_catalog()
+    old_catalog = _load_episode_catalog(show)
     old_revisions = {ep["date"]: ep.get("revision", 1) for ep in old_catalog}
 
-    episodes_db = database.list_episodes()
+    episodes_db = database.list_episodes(db_path=db_path)
     catalog = []
     for ep in episodes_db:
         entry = {
@@ -181,51 +210,52 @@ def sync_catalog_from_db() -> None:
         if old_revisions.get(ep["date"], 1) > 1:
             entry["revision"] = old_revisions[ep["date"]]
         catalog.append(entry)
-    _save_episode_catalog(catalog)
-    build_feed()
+    _save_episode_catalog(catalog, show)
+    build_feed(show)
     logger.info("Synced episodes.json from DB (%d episodes), feed rebuilt.", len(catalog))
 
 
-def bump_revision(date: str) -> int:
+def bump_revision(date: str, show: ShowConfig | None = None) -> int:
     """Increment the revision for an episode, forcing podcast apps to re-download.
 
     Returns the new revision number.
     """
-    catalog = _load_episode_catalog()
+    catalog = _load_episode_catalog(show)
     new_rev = 1
     for ep in catalog:
         if ep["date"] == date:
             ep["revision"] = ep.get("revision", 1) + 1
             new_rev = ep["revision"]
             break
-    _save_episode_catalog(catalog)
-    build_feed()
+    _save_episode_catalog(catalog, show)
+    build_feed(show)
     logger.info("Bumped revision for %s to v%d, feed rebuilt.", date, new_rev)
     return new_rev
 
 
-def clear_feed() -> None:
+def clear_feed(show: ShowConfig | None = None) -> None:
     """Remove all episodes from the feed catalog and rebuild an empty feed."""
-    _save_episode_catalog([])
-    build_feed()
+    _save_episode_catalog([], show)
+    build_feed(show)
     logger.info("Feed cleared — episodes.json emptied and feed.xml rebuilt.")
 
 
-def build_feed() -> str:
+def build_feed(show: ShowConfig | None = None) -> str:
     """Build or rebuild the complete RSS feed XML.
 
     Returns:
         Path to the generated feed.xml file.
     """
     try:
-        episodes = _load_episode_catalog()
-        fg = _build_feed_generator(episodes)
+        feed_path, _ = _resolve_paths(show)
+        episodes = _load_episode_catalog(show)
+        fg = _build_feed_generator(episodes, show)
 
-        FEED_PATH.parent.mkdir(parents=True, exist_ok=True)
-        fg.rss_file(str(FEED_PATH), pretty=True)
+        feed_path.parent.mkdir(parents=True, exist_ok=True)
+        fg.rss_file(str(feed_path), pretty=True)
 
-        logger.info("Feed written to %s (%d episodes)", FEED_PATH, len(episodes))
-        return str(FEED_PATH)
+        logger.info("Feed written to %s (%d episodes)", feed_path, len(episodes))
+        return str(feed_path)
 
     except Exception as e:
         raise FeedBuildError(f"Failed to build feed: {e}") from e

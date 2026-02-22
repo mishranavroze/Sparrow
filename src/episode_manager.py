@@ -8,13 +8,14 @@ from pathlib import Path
 
 from mutagen.mp3 import MP3
 
+from config import ShowConfig
 from src import gcs_storage
 from src.exceptions import EpisodeProcessError
 from src.models import EpisodeMetadata
 
 logger = logging.getLogger(__name__)
 
-EPISODES_DIR = Path("output/episodes")
+DEFAULT_EPISODES_DIR = Path("output/episodes")
 
 def _ffmpeg_path() -> str:
     """Resolve ffmpeg: system PATH first, then bundled imageio-ffmpeg fallback."""
@@ -90,9 +91,9 @@ def _format_duration(seconds: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def _cleanup_old_episodes() -> None:
+def _cleanup_old_episodes(episodes_dir: Path) -> None:
     """Remove old episodes beyond the retention limit."""
-    episodes = sorted(EPISODES_DIR.glob("noctua-*.mp3"))
+    episodes = sorted(episodes_dir.glob("noctua-*.mp3"))
     if len(episodes) > MAX_EPISODES:
         to_remove = episodes[: len(episodes) - MAX_EPISODES]
         for ep in to_remove:
@@ -100,17 +101,22 @@ def _cleanup_old_episodes() -> None:
             ep.unlink()
 
 
-def process(mp3_path: Path, topics_summary: str, rss_summary: str = "") -> EpisodeMetadata:
+def process(mp3_path: Path, topics_summary: str, rss_summary: str = "",
+            show: ShowConfig | None = None) -> EpisodeMetadata:
     """Validate a downloaded MP3 and extract metadata.
 
     Args:
         mp3_path: Path to the downloaded MP3 file.
         topics_summary: Brief summary of episode topics.
         rss_summary: Short (~15 word) description for the RSS feed.
+        show: Show-specific config for episodes dir and GCS namespace.
 
     Returns:
         EpisodeMetadata with duration, file size, etc.
     """
+    episodes_dir = show.episodes_dir if show else DEFAULT_EPISODES_DIR
+    show_id = show.show_id if show else "noctua"
+
     try:
         if not mp3_path.exists():
             raise EpisodeProcessError(f"MP3 file not found: {mp3_path}")
@@ -137,9 +143,9 @@ def process(mp3_path: Path, topics_summary: str, rss_summary: str = "") -> Episo
         date_str = stem.replace("noctua-", "") if stem.startswith("noctua-") else stem
 
         # Ensure file is in the episodes directory with canonical name
-        canonical_path = EPISODES_DIR / f"noctua-{date_str}.mp3"
+        canonical_path = episodes_dir / f"noctua-{date_str}.mp3"
         if mp3_path != canonical_path:
-            EPISODES_DIR.mkdir(parents=True, exist_ok=True)
+            episodes_dir.mkdir(parents=True, exist_ok=True)
             os.rename(str(mp3_path), str(canonical_path))
             logger.info("Moved episode to %s", canonical_path)
 
@@ -156,12 +162,12 @@ def process(mp3_path: Path, topics_summary: str, rss_summary: str = "") -> Episo
         gcs_url = ""
         if gcs_storage.is_configured():
             try:
-                gcs_url = gcs_storage.upload_episode(canonical_path, date_str)
+                gcs_url = gcs_storage.upload_episode(canonical_path, date_str, show_id=show_id)
             except Exception as e:
                 logger.error("GCS upload failed (continuing without): %s", e)
 
         # Clean up old episodes
-        _cleanup_old_episodes()
+        _cleanup_old_episodes(episodes_dir)
 
         return EpisodeMetadata(
             date=date_str,

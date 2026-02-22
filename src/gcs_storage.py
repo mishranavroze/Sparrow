@@ -19,18 +19,19 @@ def _get_client() -> storage.Client:
     return storage.Client(credentials=credentials, project=credentials.project_id)
 
 
-def upload_episode(local_path: Path, date: str) -> str:
+def upload_episode(local_path: Path, date: str, show_id: str = "noctua") -> str:
     """Upload an episode MP3 to GCS and return the public URL.
 
     Args:
         local_path: Path to the local MP3 file.
         date: Episode date string (YYYY-MM-DD).
+        show_id: Show identifier for namespaced blob paths.
 
     Returns:
         Public URL of the uploaded file.
     """
     bucket_name = settings.gcs_bucket_name
-    blob_name = f"episodes/noctua-{date}.mp3"
+    blob_name = f"episodes/{show_id}/noctua-{date}.mp3"
 
     client = _get_client()
     bucket = client.bucket(bucket_name)
