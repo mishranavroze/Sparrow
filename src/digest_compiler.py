@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-from config import ShowConfig
+from config import ShowConfig, ShowFormat, SHOW_FORMATS
 from src.exceptions import DigestCompileError
 from src.models import Article, CompiledDigest, DailyDigest
 from src.topic_classifier import SEGMENT_DURATIONS, SEGMENT_ORDER, Topic
@@ -33,15 +33,25 @@ changes mechanically ("now let's talk about...")
 """
 
 INTRO_SECTION = """\
-## INTRO (~1 minute)
+## INTRO (~{intro_dur} minute)
 Welcome to {podcast_name}! Today is {date}. {weather}Let's get into what's happening.
 """
 
+INTRO_SECTION_SHORT = """\
+## INTRO (~30 seconds)
+Welcome to {podcast_name}! It's {date}. {weather}Here's what's happening.
+"""
+
 OUTRO_SECTION = """\
-## OUTRO (~1 minute)
+## OUTRO (~{outro_dur} minute)
 And that wraps up today's {podcast_name}! We hope you found something in there \
 that made you smile, think, or learn something new. Remember — every day \
 brings new possibilities. Thanks for listening, and we'll see you next time. Bye!
+"""
+
+OUTRO_SECTION_SHORT = """\
+## OUTRO (~30 seconds)
+That's your morning briefing from {podcast_name}! Thanks for listening — see you tomorrow.
 """
 
 SUMMARIZATION_SYSTEM_PROMPT_TEMPLATE = """\
@@ -72,13 +82,18 @@ def _fetch_seattle_weather() -> str:
         return ""
 
 
-def _build_topics_summary(digest: DailyDigest, segment_counts: dict[str, int]) -> str:
+def _build_topics_summary(digest: DailyDigest, segment_counts: dict[str, int],
+                          show_format: ShowFormat | None = None) -> str:
     """Build a brief topics summary reflecting active segments."""
+    if show_format:
+        topic_order = show_format.segment_order
+    else:
+        topic_order = [t.value for t in SEGMENT_ORDER]
     parts = []
-    for topic in SEGMENT_ORDER:
-        count = segment_counts.get(topic.value, 0)
+    for topic_name in topic_order:
+        count = segment_counts.get(topic_name, 0)
         if count > 0:
-            parts.append(f"{topic.value} ({count})")
+            parts.append(f"{topic_name} ({count})")
     return "; ".join(parts) if parts else "No segments"
 
 
@@ -201,33 +216,45 @@ def _raw_fallback_segment(articles: list[Article], word_budget: int) -> str:
 
 
 def _compile_text(
-    digest: DailyDigest, date_str: str, podcast_name: str = "The Hootline"
+    digest: DailyDigest, date_str: str, podcast_name: str = "The Hootline",
+    show_format: ShowFormat | None = None,
 ) -> tuple[str, dict[str, int], dict[str, list[str]]]:
     """Compile articles into a segment-structured markdown document with AI summaries."""
-    # Group articles by topic
+    # Resolve segment config: use show format if provided, else global defaults
+    if show_format:
+        format_segment_order = show_format.segment_order
+        format_durations = show_format.segment_durations
+    else:
+        format_segment_order = [t.value for t in SEGMENT_ORDER]
+        format_durations = {t.value: int(d.replace("~", "").replace(" minutes", "").replace(" minute", ""))
+                           for t, d in SEGMENT_DURATIONS.items()}
+
+    # Group articles by topic, only keeping topics in this show's format
+    allowed_topics = set(format_segment_order)
     grouped: dict[str, list[Article]] = defaultdict(list)
     for article in digest.articles:
         topic_key = article.topic if article.topic else Topic.OTHER.value
-        grouped[topic_key].append(article)
+        if topic_key in allowed_topics:
+            grouped[topic_key].append(article)
 
     # Calculate word budget per segment
     segment_word_budgets: dict[str, int] = {}
-    for topic in SEGMENT_ORDER:
-        mins = _parse_minutes(topic)
-        segment_word_budgets[topic.value] = mins * WORDS_PER_MINUTE
+    for topic_name in format_segment_order:
+        mins = format_durations.get(topic_name, 1)
+        segment_word_budgets[topic_name] = mins * WORDS_PER_MINUTE
 
     # Cap articles per topic
     total_before = sum(len(v) for v in grouped.values())
-    for topic in SEGMENT_ORDER:
-        mins = _parse_minutes(topic)
+    for topic_name in format_segment_order:
+        mins = format_durations.get(topic_name, 1)
         max_articles = max(2, round(mins * 1.5))
-        articles_list = grouped.get(topic.value, [])
+        articles_list = grouped.get(topic_name, [])
         if len(articles_list) > max_articles:
             logger.info(
                 "Capping %s from %d to %d articles (allocated %dm)",
-                topic.value, len(articles_list), max_articles, mins,
+                topic_name, len(articles_list), max_articles, mins,
             )
-            grouped[topic.value] = articles_list[:max_articles]
+            grouped[topic_name] = articles_list[:max_articles]
     total_after = sum(len(v) for v in grouped.values())
     if total_after < total_before:
         logger.info("Topic capping: %d -> %d articles", total_before, total_after)
@@ -235,9 +262,16 @@ def _compile_text(
     # Fetch weather for intro
     weather = _fetch_seattle_weather()
 
-    # Build the document
-    intro = INTRO_SECTION.format(podcast_name=podcast_name, date=date_str, weather=weather)
-    outro = OUTRO_SECTION.format(podcast_name=podcast_name)
+    # Choose intro/outro based on show duration
+    is_short = show_format and show_format.intro_minutes < 1
+    if is_short:
+        intro = INTRO_SECTION_SHORT.format(podcast_name=podcast_name, date=date_str, weather=weather)
+        outro = OUTRO_SECTION_SHORT.format(podcast_name=podcast_name)
+    else:
+        intro = INTRO_SECTION.format(podcast_name=podcast_name, date=date_str, weather=weather,
+                                     intro_dur=int(show_format.intro_minutes) if show_format else 1)
+        outro = OUTRO_SECTION.format(podcast_name=podcast_name,
+                                     outro_dur=int(show_format.outro_minutes) if show_format else 1)
     preamble = PODCAST_PREAMBLE.format(podcast_name=podcast_name, date=date_str)
 
     sections = [f"# {podcast_name} — Daily Briefing — {date_str}\n"]
@@ -248,27 +282,36 @@ def _compile_text(
     segment_sources: dict[str, list[str]] = {}
     segment_number = 0
 
-    for topic in SEGMENT_ORDER:
-        articles = grouped.get(topic.value, [])
+    for topic_name in format_segment_order:
+        articles = grouped.get(topic_name, [])
         if not articles:
             continue
 
         segment_number += 1
-        segment_counts[topic.value] = len(articles)
+        segment_counts[topic_name] = len(articles)
         sources = list(dict.fromkeys(a.source for a in articles))
-        segment_sources[topic.value] = sources
+        segment_sources[topic_name] = sources
 
-        mins = _parse_minutes(topic)
-        word_budget = segment_word_budgets[topic.value]
-        duration = SEGMENT_DURATIONS.get(topic, "")
-        duration_label = f" ({duration})" if duration else ""
+        mins = format_durations.get(topic_name, 1)
+        word_budget = segment_word_budgets[topic_name]
+        duration_label = f" (~{mins} {'minute' if mins == 1 else 'minutes'})"
 
-        section_header = f"## SEGMENT {segment_number}: {topic.value}{duration_label}"
+        # Find the Topic enum for AI summarization
+        topic_enum = None
+        for t in Topic:
+            if t.value == topic_name:
+                topic_enum = t
+                break
+
+        section_header = f"## SEGMENT {segment_number}: {topic_name}{duration_label}"
         section_header += f"\n**Word budget: ~{word_budget} words**"
         sections.append(section_header)
 
         # Try AI summarization, fall back to raw text
-        summary = _summarize_segment(topic, articles, word_budget, podcast_name=podcast_name)
+        if topic_enum:
+            summary = _summarize_segment(topic_enum, articles, word_budget, podcast_name=podcast_name)
+        else:
+            summary = None
         if summary:
             sections.append(summary)
         else:
@@ -307,11 +350,13 @@ def compile(digest: DailyDigest, show: ShowConfig | None = None) -> CompiledDige
     date_ymd = episode_date.strftime("%Y-%m-%d")
     date_display = episode_date.strftime("%B %-d, %Y")
 
+    show_format = show.format if show else None
+
     try:
         text, segment_counts, segment_sources = _compile_text(
-            digest, date_display, podcast_name=podcast_name
+            digest, date_display, podcast_name=podcast_name, show_format=show_format,
         )
-        topics_summary = _build_topics_summary(digest, segment_counts)
+        topics_summary = _build_topics_summary(digest, segment_counts, show_format=show_format)
         rss_summary = _generate_rss_summary(digest.articles, podcast_name=podcast_name)
         total_words = len(text.split())
 

@@ -17,7 +17,7 @@ from fastapi import FastAPI, Form, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from config import ShowConfig, settings, shows
+from config import ShowConfig, ShowFormat, SHOW_FORMATS, settings, shows
 from src import database, episode_manager, feed_builder
 from src.models import CompiledDigest
 
@@ -318,11 +318,24 @@ async def api_shows():
     ])
 
 
+@app.get("/api/show-format")
+async def api_show_format(show_id: str = Query(default="")):
+    """Return the segment format for a show (used by dashboard JS)."""
+    state = _resolve_show(show_id)
+    fmt = state.show.format
+    return JSONResponse({
+        "segments": [{"name": name, "minutes": mins} for name, mins in fmt.segments],
+        "intro_minutes": fmt.intro_minutes,
+        "outro_minutes": fmt.outro_minutes,
+        "total_minutes": fmt.total_minutes,
+    })
+
+
 # --- Dashboard ---
 
 @app.get("/")
 async def dashboard():
-    """Main dashboard (default show)."""
+    """Root redirects to default show dashboard."""
     return HTMLResponse(
         content=_build_dashboard_html(),
         headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
@@ -494,13 +507,11 @@ async def api_topic_coverage(
     """Radar chart data: target vs actual topic coverage."""
     state = _resolve_show(show_id)
     db_path = state.show.db_path
+    fmt = state.show.format
 
-    from src.topic_classifier import SEGMENT_DURATIONS, SEGMENT_ORDER
-
-    duration_map = {}
-    for topic, dur_str in SEGMENT_DURATIONS.items():
-        minutes = int(dur_str.replace("~", "").replace(" minutes", "").replace(" minute", ""))
-        duration_map[topic.value] = minutes
+    # Use per-show segment config
+    show_segment_order = fmt.segment_order
+    duration_map = fmt.segment_durations
 
     prep_digest_data = None
     if state.preparation_active and state.preparation_digest and not published_only:
@@ -532,8 +543,7 @@ async def api_topic_coverage(
 
     num_digests = max(len(digests), 1)
     topics = []
-    for topic in SEGMENT_ORDER:
-        name = topic.value
+    for name in show_segment_order:
         mins = duration_map.get(name, 1)
         capacity = max(2, round(mins * 1.5))
         actual_articles = totals.get(name, 0)
@@ -557,8 +567,8 @@ async def api_topic_coverage(
 
     suggestions = []
     if has_data:
-        for topic_enum, t in zip(SEGMENT_ORDER, topics):
-            topic_sources = sorted(all_sources.get(topic_enum.value, []))
+        for topic_name, t in zip(show_segment_order, topics):
+            topic_sources = sorted(all_sources.get(topic_name, []))
             if t["actual_pct"] < 30:
                 suggestions.append({
                     "topic": t["name"],
@@ -1203,16 +1213,19 @@ async def health_detail() -> dict:
 
 def _build_dashboard_html(show_id: str = "") -> str:
     """Build the dashboard HTML with the given show_id baked in."""
-    # Determine show title for the header
+    # Determine show title and tagline for the header
     if show_id and show_id in _show_states:
-        title = _show_states[show_id].show.podcast_title
+        show = _show_states[show_id].show
     else:
-        # Default show
-        default_state = _resolve_show("")
-        title = default_state.show.podcast_title
-        show_id = default_state.show.show_id
+        show = _resolve_show("").show
+        show_id = show.show_id
+    title = show.podcast_title
+    tagline = show.podcast_description
 
-    return DASHBOARD_HTML.replace("__SHOW_ID__", show_id).replace("__SHOW_TITLE__", title)
+    return (DASHBOARD_HTML
+            .replace("__SHOW_ID__", show_id)
+            .replace("__SHOW_TITLE__", title)
+            .replace("__SHOW_TAGLINE__", tagline))
 
 
 DASHBOARD_HTML = """\
@@ -1268,15 +1281,6 @@ DASHBOARD_HTML = """\
   .btn:hover { background: var(--accent-dim); color: var(--bg); }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .btn:disabled:hover { background: transparent; color: var(--accent); }
-
-  /* Show switcher */
-  .show-switcher { display: flex; gap: 4px; margin-left: 12px; }
-  .show-switcher a {
-    font-size: 10px; color: var(--text-dim); text-decoration: none;
-    padding: 3px 8px; border-radius: 4px; border: 1px solid var(--border);
-  }
-  .show-switcher a:hover { color: var(--text); border-color: var(--text-dim); }
-  .show-switcher a.active { color: var(--accent); border-color: var(--accent-dim); background: rgba(196,160,82,0.1); }
 
   /* Tabs */
   .tab-bar { display: flex; border-bottom: 1px solid var(--border); padding: 0 24px; }
@@ -1395,9 +1399,8 @@ DASHBOARD_HTML = """\
   <div style="display:flex;align-items:center;gap:12px;">
     <div>
       <h1 id="show-title">__SHOW_TITLE__</h1>
-      <div class="tagline">The owl of Minerva spreads its wings only with the falling of dusk.</div>
+      <div class="tagline">__SHOW_TAGLINE__</div>
     </div>
-    <div class="show-switcher" id="show-switcher"></div>
   </div>
   <div class="actions">
     <span style="font-size:10px;color:var(--text-dim);" id="sched-info"></span>
@@ -1433,6 +1436,7 @@ DASHBOARD_HTML = """\
 const SHOW_ID = '__SHOW_ID__';
 const SHOW_TITLE = '__SHOW_TITLE__';
 let radarMode = 'latest';
+let _showFormat = null; // loaded from API
 
 // Helper to append show_id query parameter
 function apiUrl(path, extraParams) {
@@ -1442,21 +1446,12 @@ function apiUrl(path, extraParams) {
   return url;
 }
 
-// Load show switcher
-async function loadShowSwitcher() {
+// Load show format from API
+async function loadShowFormat() {
   try {
-    const res = await fetch('/api/shows');
-    const shows = await res.json();
-    if (shows.length <= 1) return;
-    const box = document.getElementById('show-switcher');
-    let h = '';
-    for (const s of shows) {
-      const href = s.id === shows[0].id ? '/' : '/' + s.id + '/';
-      const cls = s.id === SHOW_ID ? 'active' : '';
-      h += '<a href="' + href + '" class="' + cls + '">' + esc(s.title) + '</a>';
-    }
-    box.innerHTML = h;
-  } catch(e) {}
+    const res = await fetch(apiUrl('/api/show-format'));
+    _showFormat = await res.json();
+  } catch(e) { console.error('Failed to load show format', e); }
 }
 
 function switchTab(tab) {
@@ -1477,50 +1472,56 @@ function esc(s) {
 let _prepActive = false;
 
 function segmentCard() {
-  const segs = [
-    ['Latest in Tech', 5], ['Product Management', 4], ['World Politics', 4],
-    ['US Politics', 3], ['Indian Politics', 3], ['Entertainment', 3],
-    ['CrossFit', 2], ['F1', 2], ['Arsenal', 1], ['Indian Cricket', 1],
-    ['Badminton', 1], ['Sports', 1], ['Seattle', 1], ['Other', 1],
-  ];
+  if (!_showFormat) return '';
+  const segs = _showFormat.segments;
+  const introMin = _showFormat.intro_minutes;
+  const outroMin = _showFormat.outro_minutes;
+  const isShort = introMin < 1;
+
   let s = '<div class="card"><div class="card-label">Show Format</div>';
   // Intro
+  const introDur = isShort ? '~30s' : '~' + Math.round(introMin) + ' min';
+  const introText = isShort
+    ? 'Welcome to ' + esc(SHOW_TITLE) + '! Here\\'s what\\'s happening.'
+    : 'Welcome to ' + esc(SHOW_TITLE) + ', your daily knowledge briefing. Let\\'s dive in.';
   s += '<div style="font-size:11px;color:var(--text-dim);margin-top:6px;padding:6px 8px;background:rgba(255,255,255,0.03);border-radius:4px;">';
-  s += '<span style="color:var(--gold);font-weight:600;">Intro (~1 min)</span><br>';
-  s += 'Welcome to ' + esc(SHOW_TITLE) + ', your daily knowledge briefing. Let\\'s dive in.';
+  s += '<span style="color:var(--gold);font-weight:600;">Intro (' + introDur + ')</span><br>' + introText;
   s += '</div>';
   // Segments
   s += '<div style="display:grid;grid-template-columns:1fr auto;gap:2px 12px;font-size:11px;margin-top:8px;">';
-  let total = 2; // 1 min intro + 1 min outro
-  for (const [name, mins] of segs) {
-    total += mins;
-    s += '<span style="color:var(--text);">' + name + '</span>';
-    s += '<span style="color:var(--text-dim);text-align:right;">~' + mins + ' min</span>';
+  let total = introMin + outroMin;
+  for (const seg of segs) {
+    total += seg.minutes;
+    s += '<span style="color:var(--text);">' + esc(seg.name) + '</span>';
+    s += '<span style="color:var(--text-dim);text-align:right;">~' + seg.minutes + ' min</span>';
   }
   s += '</div>';
   // Outro
+  const outroDur = isShort ? '~30s' : '~' + Math.round(outroMin) + ' min';
+  const outroText = isShort
+    ? 'That\\'s your morning briefing from ' + esc(SHOW_TITLE) + '! See you tomorrow.'
+    : 'That\\'s all for today\\'s ' + esc(SHOW_TITLE) + '. Thanks for listening — we\\'ll be back tomorrow with more. Until then, stay curious.';
   s += '<div style="font-size:11px;color:var(--text-dim);margin-top:8px;padding:6px 8px;background:rgba(255,255,255,0.03);border-radius:4px;">';
-  s += '<span style="color:var(--gold);font-weight:600;">Outro (~1 min)</span><br>';
-  s += 'That\\'s all for today\\'s ' + esc(SHOW_TITLE) + '. Thanks for listening — we\\'ll be back tomorrow with more. Until then, stay curious.';
+  s += '<span style="color:var(--gold);font-weight:600;">Outro (' + outroDur + ')</span><br>' + outroText;
   s += '</div>';
   // Total
   s += '<div style="display:grid;grid-template-columns:1fr auto;gap:0 12px;font-size:11px;margin-top:8px;border-top:1px solid var(--border);padding-top:6px;">';
   s += '<span style="color:var(--gold);font-weight:600;">Total</span>';
-  s += '<span style="color:var(--gold);font-weight:600;text-align:right;">~' + total + ' min</span>';
+  s += '<span style="color:var(--gold);font-weight:600;text-align:right;">~' + Math.round(total) + ' min</span>';
   s += '</div></div>';
   return s;
 }
 
 function topicBreakdown(d) {
-  if (!d || !d.segment_counts) return '';
+  if (!d || !d.segment_counts || !_showFormat) return '';
   const sc = d.segment_counts;
-  const durMap = {
-    'Latest in Tech':5,'Product Management':4,'World Politics':4,
-    'US Politics':3,'Indian Politics':3,'Entertainment':3,
-    'CrossFit':2,'Formula 1':2,'Arsenal':1,'Indian Cricket':1,
-    'Badminton':1,'Sports':1,'Seattle':1,'Misc':1
-  };
-  const order = Object.keys(durMap);
+  // Build duration map from show format
+  const durMap = {};
+  const order = [];
+  for (const seg of _showFormat.segments) {
+    durMap[seg.name] = seg.minutes;
+    order.push(seg.name);
+  }
   let rows = '';
   let totalArticles = 0, totalMins = 0;
   for (const topic of order) {
@@ -2001,9 +2002,10 @@ async function updateHealth() {
   } catch(e) {}
 }
 
-loadShowSwitcher();
-loadLatest();
-updateHealth();
+loadShowFormat().then(() => {
+  loadLatest();
+  updateHealth();
+});
 setInterval(updateHealth, 10000);
 </script>
 </body>

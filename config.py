@@ -56,6 +56,51 @@ settings = Settings()
 
 
 @dataclass(frozen=True)
+class ShowFormat:
+    """Per-show segment format defining which topics and how long each gets."""
+
+    segments: tuple[tuple[str, int], ...]  # (topic_name, minutes) pairs
+    intro_minutes: float = 1.0
+    outro_minutes: float = 1.0
+
+    @property
+    def segment_order(self) -> list[str]:
+        return [name for name, _ in self.segments]
+
+    @property
+    def segment_durations(self) -> dict[str, int]:
+        return {name: mins for name, mins in self.segments}
+
+    @property
+    def total_minutes(self) -> int:
+        return int(self.intro_minutes + sum(m for _, m in self.segments) + self.outro_minutes)
+
+
+# Per-show format definitions
+SHOW_FORMATS: dict[str, ShowFormat] = {
+    "hootline": ShowFormat(
+        segments=(
+            ("Latest in Tech", 5), ("Product Management", 4), ("World Politics", 4),
+            ("US Politics", 3), ("Indian Politics", 3), ("Entertainment", 3),
+            ("CrossFit", 2), ("Formula 1", 2), ("Arsenal", 1), ("Indian Cricket", 1),
+            ("Badminton", 1), ("Sports", 1), ("Seattle", 1), ("Misc", 1),
+        ),
+        intro_minutes=1.0,
+        outro_minutes=1.0,
+    ),
+    "sparrow": ShowFormat(
+        segments=(
+            ("Indian Politics", 2), ("Entertainment", 2),
+        ),
+        intro_minutes=0.5,
+        outro_minutes=0.5,
+    ),
+}
+
+_DEFAULT_FORMAT = SHOW_FORMATS["hootline"]
+
+
+@dataclass(frozen=True)
 class ShowConfig:
     """Per-show configuration encapsulating all show-specific settings."""
 
@@ -69,6 +114,10 @@ class ShowConfig:
     google_account_email: str
     google_account_password: str
     output_dir: Path
+
+    @property
+    def format(self) -> ShowFormat:
+        return SHOW_FORMATS.get(self.show_id, _DEFAULT_FORMAT)
 
     @property
     def db_path(self) -> Path:
@@ -144,7 +193,7 @@ def load_shows() -> dict[str, ShowConfig]:
             notebooklm_notebook_url=_get_env(f"{prefix}NOTEBOOKLM_NOTEBOOK_URL"),
             google_account_email=_get_env(f"{prefix}GOOGLE_ACCOUNT_EMAIL"),
             google_account_password=_get_env(f"{prefix}GOOGLE_ACCOUNT_PASSWORD"),
-            output_dir=Path(f"output/{sid}"),
+            output_dir=Path("output") if sid == "hootline" else Path(f"output/{sid}"),
         )
 
     return result
