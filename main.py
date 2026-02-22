@@ -1454,6 +1454,11 @@ async function loadShowFormat() {
     const res = await fetch(apiUrl('/api/show-format'));
     _showFormat = await res.json();
   } catch(e) { console.error('Failed to load show format', e); }
+  // Set correct RSS feed link per show
+  const feedLink = document.getElementById('feed-link');
+  if (feedLink) {
+    feedLink.href = SHOW_ID === 'hootline' ? '/feed.xml' : '/' + SHOW_ID + '/feed.xml';
+  }
 }
 
 function switchTab(tab) {
