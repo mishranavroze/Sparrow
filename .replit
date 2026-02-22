@@ -18,7 +18,7 @@ externalPort = 8000
 PORT = "5000"
 
 [deployment]
-deploymentTarget = "autoscale"
+deploymentTarget = "gce"
 run = ["bash", "start.sh"]
 build = ["bash", "-c", "pip install -e . 2>/dev/null; playwright install chromium"]
 
