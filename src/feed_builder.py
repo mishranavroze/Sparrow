@@ -75,9 +75,14 @@ def _build_feed_generator(episodes: list[dict], show: ShowConfig | None = None) 
     fg.language("en")
     fg.generator(f"{title} Podcast Generator")
 
-    # Channel-level image (standard RSS)
+    # Channel-level image (standard RSS) — per-show icon
+    if show_id == "sparrow":
+        image_url = f"{settings.base_url}/static/noctua_owl.png"
+    else:
+        image_url = f"{settings.base_url}/static/noctua-owl.png"
+
     fg.image(
-        url=f"{settings.base_url}/static/noctua-owl.png",
+        url=image_url,
         title=title,
         link=settings.base_url,
     )
@@ -88,7 +93,7 @@ def _build_feed_generator(episodes: list[dict], show: ShowConfig | None = None) 
     fg.podcast.itunes_explicit("no")
     fg.podcast.itunes_summary(description)
     fg.podcast.itunes_owner(name="Aannesha Satpati", email="aannesha.satpati@gmail.com")
-    fg.podcast.itunes_image(f"{settings.base_url}/static/noctua-owl.png")
+    fg.podcast.itunes_image(image_url)
 
     # Add episodes (most recent first)
     for ep in sorted(episodes, key=lambda e: e["date"], reverse=True)[:MAX_FEED_EPISODES]:
