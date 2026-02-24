@@ -62,7 +62,8 @@
       "WebFetch(domain:medium.com)",
       "Bash(git show HEAD:output/noctua.db > /dev/null 2>&1 && echo \"noctua.db IS tracked in git\" || echo \"noctua.db NOT tracked in git\"\ngit ls-files output/ 2>&1\necho \"---\"\ncat .gitignore 2>&1 | head -30)",
       "Bash(git rm --cached output/noctua.db output/episodes.json output/sparrow/noctua.db output/sparrow/episodes.json output/sparrow/feed.xml 2>&1)",
-      "Bash(git add scripts/gmail_auth.py src/digest_compiler.py src/topic_classifier.py && git commit -m \"$\\(cat <<'EOF'\nConsolidate Gemini API calls to single call and add multi-show Gmail auth\n\n- Replace ~16 per-segment API calls with a single _summarize_all_segments\\(\\)\n  call that produces all segment narratives + RSS summary in one request\n- Remove AI classification from topic_classifier.py, use regex-only path\n- Update gmail_auth.py to support multi-show token management \\(show_id arg\\)\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\" && git status)"
+      "Bash(git add scripts/gmail_auth.py src/digest_compiler.py src/topic_classifier.py && git commit -m \"$\\(cat <<'EOF'\nConsolidate Gemini API calls to single call and add multi-show Gmail auth\n\n- Replace ~16 per-segment API calls with a single _summarize_all_segments\\(\\)\n  call that produces all segment narratives + RSS summary in one request\n- Remove AI classification from topic_classifier.py, use regex-only path\n- Update gmail_auth.py to support multi-show token management \\(show_id arg\\)\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\" && git status)",
+      "Bash(python scripts/backfill.py 2026-02-22 2026-02-23 2>&1)"
     ]
   }
 }
