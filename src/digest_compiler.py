@@ -1,6 +1,7 @@
 """Compile parsed articles into a single source document for NotebookLM."""
 
 import logging
+import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -97,71 +98,119 @@ def _build_topics_summary(digest: DailyDigest, segment_counts: dict[str, int],
     return "; ".join(parts) if parts else "No segments"
 
 
-def _generate_rss_summary(articles: list[Article], podcast_name: str = "The Hootline") -> str:
-    """Generate a short (~15 word) episode description using the Claude API."""
-    from src.llm_client import call_haiku
-    from src.exceptions import ClaudeAPIError
+def _summarize_all_segments(
+    grouped: dict[str, list[Article]],
+    segment_word_budgets: dict[str, int],
+    segment_order: list[str],
+    podcast_name: str = "The Hootline",
+) -> tuple[dict[str, str], str] | None:
+    """Summarize all segments and generate RSS summary in a single API call.
 
-    titles = [a.title for a in articles[:30]]
-    titles_text = "\n".join(f"- {t}" for t in titles)
-
-    try:
-        summary = call_haiku(
-            system="You write concise podcast episode descriptions.",
-            user_message=(
-                "Below are today's podcast episode article titles.\n\n"
-                f"{titles_text}\n\n"
-                "Write a single sentence (~15 words) summarizing what "
-                "this episode covers. No quotes, no preamble — just the sentence."
-            ),
-            max_tokens=60,
-            temperature=0.0,
-            timeout=15,
-        )
-        summary = summary.strip().rstrip(".")
-        if len(summary.split()) > 25:
-            summary = " ".join(summary.split()[:20])
-        return summary
-    except (ClaudeAPIError, Exception) as e:
-        logger.warning("RSS summary generation failed: %s — using fallback", e)
-        return f"Your nightly knowledge briefing from {podcast_name}."
-
-
-def _summarize_segment(topic: Topic, articles: list[Article], word_budget: int,
-                       podcast_name: str = "The Hootline") -> str | None:
-    """Use Claude Sonnet to write a narrative summary for a topic segment.
-
-    Returns the summary text, or None if the API call fails.
+    Returns (segment_texts, rss_summary) or None if the call fails.
     """
     from src.llm_client import call_sonnet
     from src.exceptions import ClaudeAPIError
 
     system_prompt = SUMMARIZATION_SYSTEM_PROMPT_TEMPLATE.format(podcast_name=podcast_name)
 
-    article_texts = []
-    for a in articles:
-        content_preview = a.content[:1500]
-        article_texts.append(f"### {a.title}\nSource: {a.source}\n{content_preview}")
-    combined = "\n\n---\n\n".join(article_texts)
+    # Build the prompt with all segments
+    parts = []
+    segment_number = 0
+    total_word_budget = 0
+    for topic_name in segment_order:
+        articles = grouped.get(topic_name, [])
+        if not articles:
+            continue
+        segment_number += 1
+        word_budget = segment_word_budgets.get(topic_name, 150)
+        total_word_budget += word_budget
+
+        article_texts = []
+        for a in articles:
+            content_preview = a.content[:1500]
+            article_texts.append(f"### {a.title}\nSource: {a.source}\n{content_preview}")
+        combined = "\n\n".join(article_texts)
+
+        parts.append(
+            f"## SEGMENT {segment_number}: {topic_name}\n"
+            f"Word budget: ~{word_budget} words\n\n"
+            f"Articles:\n{combined}"
+        )
+
+    if not parts:
+        return None
+
+    # Collect article titles for RSS summary
+    all_titles = []
+    for topic_name in segment_order:
+        for a in grouped.get(topic_name, []):
+            all_titles.append(a.title)
+    titles_text = "\n".join(f"- {t}" for t in all_titles[:30])
 
     user_message = (
-        f"Topic: {topic.value}\n"
-        f"Word budget: ~{word_budget} words\n\n"
-        f"Articles:\n\n{combined}\n\n"
-        f"Write a flowing narrative segment (~{word_budget} words) covering the key points from these articles."
+        "Write ALL of the following podcast segment narratives. "
+        "For each segment, write a flowing prose narrative (no bullet points, no host labels) "
+        "that stays within its word budget. "
+        "Use the exact header format shown (## SEGMENT N: Topic) for each segment.\n\n"
+        + "\n\n---\n\n".join(parts)
+        + "\n\n---RSS_SUMMARY---\n"
+        "Finally, after the delimiter above, write a single sentence (~15 words) "
+        "summarizing what this episode covers. No quotes, no preamble — just the sentence.\n\n"
+        f"Article titles for reference:\n{titles_text}"
     )
 
     try:
-        return call_sonnet(
+        response = call_sonnet(
             system=system_prompt,
             user_message=user_message,
-            max_tokens=word_budget * 3,
+            max_tokens=total_word_budget * 3 + 100,
             temperature=0.3,
-            timeout=60,
+            timeout=120,
         )
     except ClaudeAPIError as e:
-        logger.warning("Segment summarization failed for %s: %s — using raw text", topic.value, e)
+        logger.warning("Single-call summarization failed: %s — using raw fallback", e)
         return None
+
+    # Parse the response into per-segment texts and RSS summary
+    segment_texts: dict[str, str] = {}
+    rss_summary = ""
+
+    # Split off RSS summary
+    if "---RSS_SUMMARY---" in response:
+        body, rss_part = response.split("---RSS_SUMMARY---", 1)
+        rss_summary = rss_part.strip().rstrip(".")
+        if len(rss_summary.split()) > 25:
+            rss_summary = " ".join(rss_summary.split()[:20])
+    else:
+        body = response
+
+    # Parse segment blocks by header pattern
+    segment_pattern = re.compile(r"## SEGMENT \d+:\s*(.+)")
+    current_topic = None
+    current_lines: list[str] = []
+
+    for line in body.split("\n"):
+        match = segment_pattern.match(line.strip())
+        if match:
+            # Save previous segment
+            if current_topic is not None:
+                segment_texts[current_topic] = "\n".join(current_lines).strip()
+            current_topic = match.group(1).strip()
+            current_lines = []
+        else:
+            current_lines.append(line)
+
+    # Save last segment
+    if current_topic is not None:
+        segment_texts[current_topic] = "\n".join(current_lines).strip()
+
+    logger.info(
+        "Single API call produced %d segment summaries (RSS summary: %s)",
+        len(segment_texts),
+        "yes" if rss_summary else "no",
+    )
+
+    return segment_texts, rss_summary
 
 
 def _parse_minutes(topic: Topic) -> int:
@@ -218,8 +267,11 @@ def _raw_fallback_segment(articles: list[Article], word_budget: int) -> str:
 def _compile_text(
     digest: DailyDigest, date_str: str, podcast_name: str = "The Hootline",
     show_format: ShowFormat | None = None,
-) -> tuple[str, dict[str, int], dict[str, list[str]]]:
-    """Compile articles into a segment-structured markdown document with AI summaries."""
+) -> tuple[str, dict[str, int], dict[str, list[str]], str]:
+    """Compile articles into a segment-structured markdown document with AI summaries.
+
+    Returns (text, segment_counts, segment_sources, rss_summary).
+    """
     # Resolve segment config: use show format if provided, else global defaults
     if show_format:
         format_segment_order = show_format.segment_order
@@ -259,6 +311,16 @@ def _compile_text(
     if total_after < total_before:
         logger.info("Topic capping: %d -> %d articles", total_before, total_after)
 
+    # Single API call for all segment summaries + RSS summary
+    ai_result = _summarize_all_segments(
+        grouped, segment_word_budgets, format_segment_order, podcast_name=podcast_name,
+    )
+    if ai_result:
+        ai_segments, rss_summary = ai_result
+    else:
+        ai_segments = {}
+        rss_summary = f"Your daily knowledge briefing from {podcast_name}."
+
     # Fetch weather for intro
     weather = _fetch_seattle_weather()
 
@@ -296,22 +358,12 @@ def _compile_text(
         word_budget = segment_word_budgets[topic_name]
         duration_label = f" (~{mins} {'minute' if mins == 1 else 'minutes'})"
 
-        # Find the Topic enum for AI summarization
-        topic_enum = None
-        for t in Topic:
-            if t.value == topic_name:
-                topic_enum = t
-                break
-
         section_header = f"## SEGMENT {segment_number}: {topic_name}{duration_label}"
         section_header += f"\n**Word budget: ~{word_budget} words**"
         sections.append(section_header)
 
-        # Try AI summarization, fall back to raw text
-        if topic_enum:
-            summary = _summarize_segment(topic_enum, articles, word_budget, podcast_name=podcast_name)
-        else:
-            summary = None
+        # Use pre-generated AI summary, fall back to raw text
+        summary = ai_segments.get(topic_name)
         if summary:
             sections.append(summary)
         else:
@@ -330,7 +382,7 @@ def _compile_text(
         )
         text = text[:MAX_SOURCE_CHARS - 100] + "\n\n[Document truncated to fit source limit.]"
 
-    return text, segment_counts, segment_sources
+    return text, segment_counts, segment_sources, rss_summary
 
 
 def compile(digest: DailyDigest, show: ShowConfig | None = None) -> CompiledDigest:
@@ -353,11 +405,10 @@ def compile(digest: DailyDigest, show: ShowConfig | None = None) -> CompiledDige
     show_format = show.format if show else None
 
     try:
-        text, segment_counts, segment_sources = _compile_text(
+        text, segment_counts, segment_sources, rss_summary = _compile_text(
             digest, date_display, podcast_name=podcast_name, show_format=show_format,
         )
         topics_summary = _build_topics_summary(digest, segment_counts, show_format=show_format)
-        rss_summary = _generate_rss_summary(digest.articles, podcast_name=podcast_name)
         total_words = len(text.split())
 
         compiled = CompiledDigest(
