@@ -1318,12 +1318,20 @@ DASHBOARD_HTML = """\
   .digest-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
   .digest-stats { font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
   .digest-topics { font-size: 11px; color: var(--text-dim); line-height: 1.5; }
+  .digest-btns { display: flex; gap: 6px; flex-shrink: 0; }
   .dl-btn {
     flex-shrink: 0; font-size: 12px; color: var(--bg); background: var(--accent);
-    border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer;
+    border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer;
     font-family: inherit; font-weight: 500; text-decoration: none; white-space: nowrap;
   }
   .dl-btn:hover { background: var(--accent-dim); }
+  .copy-url-btn {
+    flex-shrink: 0; font-size: 12px; color: var(--accent); background: transparent;
+    border: 1px solid var(--accent); padding: 8px 12px; border-radius: 6px; cursor: pointer;
+    font-family: inherit; font-weight: 500; white-space: nowrap;
+  }
+  .copy-url-btn:hover { background: var(--accent); color: var(--bg); }
+  .copy-url-btn.copied { border-color: var(--ok); color: var(--ok); }
 
   /* Upload */
   .upload-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
@@ -1469,6 +1477,15 @@ function switchTab(tab) {
   if (tab === 'history') loadHistory();
 }
 
+function copyDigestUrl(url, btn) {
+  const full = window.location.origin + url;
+  navigator.clipboard.writeText(full).then(function() {
+    btn.classList.add('copied');
+    btn.textContent = 'Copied!';
+    setTimeout(function() { btn.classList.remove('copied'); btn.textContent = 'Copy URL'; }, 2000);
+  });
+}
+
 function esc(s) {
   const d = document.createElement('div');
   d.textContent = s;
@@ -1598,7 +1615,8 @@ async function loadLatest() {
     h += '<div class="card"><div class="card-label">Today\\'s Digest</div><div class="digest-row"><div>';
     h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + (d.email_count||0) + ' emails &middot; ' + d.total_words.toLocaleString() + ' words</div>';
     h += '<div class="digest-topics">' + esc(d.topics_summary||'') + '</div>';
-    h += '</div><a class="dl-btn" href="' + d.download_url + '" download>Download .md</a></div></div>';
+    h += '</div><div class="digest-btns"><button class="copy-url-btn" onclick="copyDigestUrl(\'' + d.download_url + '\', this)">Copy URL</button>';
+    h += '<a class="dl-btn" href="' + d.download_url + '" download title="Download .md">&#x2B07;</a></div></div></div>';
     h += topicBreakdown(d);
   }
 
@@ -1650,7 +1668,8 @@ function renderPreparation(prep) {
     h += '<div class="card"><div class="card-label">New Digest Ready</div><div class="digest-row"><div>';
     h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + (d.email_count||0) + ' emails &middot; ' + d.total_words.toLocaleString() + ' words</div>';
     h += '<div class="digest-topics">' + esc(d.topics_summary||'') + '</div>';
-    h += '</div><a class="dl-btn" href="' + d.download_url + '" download>Download .md</a></div></div>';
+    h += '</div><div class="digest-btns"><button class="copy-url-btn" onclick="copyDigestUrl(\'' + d.download_url + '\', this)">Copy URL</button>';
+    h += '<a class="dl-btn" href="' + d.download_url + '" download title="Download .md">&#x2B07;</a></div></div></div>';
     h += topicBreakdown(d);
   }
 
@@ -1857,8 +1876,9 @@ async function loadHistory() {
       const dt = new Date(r.date+'T00:00:00');
       const dd = dt.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'});
 
+      const digestUrl = '/digests/'+r.date+'.md?show_id='+encodeURIComponent(SHOW_ID);
       const digestC = r.has_digest
-        ? '<a class="h-link digest" href="/digests/'+r.date+'.md?show_id='+encodeURIComponent(SHOW_ID)+'" download>Download</a>'
+        ? '<span class="digest-btns" style="gap:4px;"><button class="copy-url-btn" style="padding:4px 8px;font-size:11px;" onclick="copyDigestUrl(\''+digestUrl+'\', this)">Copy URL</button><a class="h-link digest" href="'+digestUrl+'" download title="Download .md">&#x2B07;</a></span>'
         : '<span class="h-badge no">none</span>';
 
       let audioC;
