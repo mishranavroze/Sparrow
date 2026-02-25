@@ -1059,6 +1059,14 @@ async def api_cancel_preparation(show_id: str = Query(default="")):
 @app.post("/api/upload-episode")
 async def api_upload_episode(file: UploadFile, date: str = Form(""), show_id: str = Form("")):
     """Upload audio for a given digest date (preview only, no publishing)."""
+    try:
+        return await _handle_upload(file, date, show_id)
+    except Exception as e:
+        logger.error("Unhandled upload error: %s", e, exc_info=True)
+        return JSONResponse({"error": f"Upload failed: {e}"}, status_code=500)
+
+
+async def _handle_upload(file: UploadFile, date: str, show_id: str):
     state = _resolve_show(show_id)
     show = state.show
     episodes_dir = show.episodes_dir
@@ -1100,14 +1108,21 @@ async def api_upload_episode(file: UploadFile, date: str = Form(""), show_id: st
     mp3_path = episodes_dir / f"noctua-{date}.prep.mp3"
     upload_path = episodes_dir / f"noctua-{date}.prep{ext}"
     try:
-        contents = await file.read()
-        if len(contents) == 0:
+        total_bytes = 0
+        with open(upload_path, "wb") as f:
+            while chunk := await file.read(1024 * 1024):  # 1MB chunks
+                f.write(chunk)
+                total_bytes += len(chunk)
+        if total_bytes == 0:
+            upload_path.unlink(missing_ok=True)
             return JSONResponse(
                 {"error": "Uploaded file is empty."},
                 status_code=400,
             )
-        upload_path.write_bytes(contents)
+        logger.info("Saved upload %s (%d bytes)", upload_path.name, total_bytes)
     except Exception as e:
+        logger.error("Failed to save uploaded file: %s", e)
+        upload_path.unlink(missing_ok=True)
         return JSONResponse(
             {"error": f"Failed to save file: {e}"},
             status_code=500,
