@@ -1615,7 +1615,7 @@ async function loadLatest() {
     h += '<div class="card"><div class="card-label">Today\\'s Digest</div><div class="digest-row"><div>';
     h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + (d.email_count||0) + ' emails &middot; ' + d.total_words.toLocaleString() + ' words</div>';
     h += '<div class="digest-topics">' + esc(d.topics_summary||'') + '</div>';
-    h += '</div><div class="digest-btns"><button class="copy-url-btn" onclick="copyDigestUrl(\'' + d.download_url + '\', this)">Copy URL</button>';
+    h += '</div><div class="digest-btns"><button class="copy-url-btn" onclick="copyDigestUrl(\\'' + d.download_url + '\\', this)">Copy URL</button>';
     h += '<a class="dl-btn" href="' + d.download_url + '" download title="Download .md">&#x2B07;</a></div></div></div>';
     h += topicBreakdown(d);
   }
@@ -1668,7 +1668,7 @@ function renderPreparation(prep) {
     h += '<div class="card"><div class="card-label">New Digest Ready</div><div class="digest-row"><div>';
     h += '<div class="digest-stats">' + d.article_count + ' articles &middot; ' + (d.email_count||0) + ' emails &middot; ' + d.total_words.toLocaleString() + ' words</div>';
     h += '<div class="digest-topics">' + esc(d.topics_summary||'') + '</div>';
-    h += '</div><div class="digest-btns"><button class="copy-url-btn" onclick="copyDigestUrl(\'' + d.download_url + '\', this)">Copy URL</button>';
+    h += '</div><div class="digest-btns"><button class="copy-url-btn" onclick="copyDigestUrl(\\'' + d.download_url + '\\', this)">Copy URL</button>';
     h += '<a class="dl-btn" href="' + d.download_url + '" download title="Download .md">&#x2B07;</a></div></div></div>';
     h += topicBreakdown(d);
   }
@@ -1878,7 +1878,7 @@ async function loadHistory() {
 
       const digestUrl = '/digests/'+r.date+'.md?show_id='+encodeURIComponent(SHOW_ID);
       const digestC = r.has_digest
-        ? '<span class="digest-btns" style="gap:4px;"><button class="copy-url-btn" style="padding:4px 8px;font-size:11px;" onclick="copyDigestUrl(\''+digestUrl+'\', this)">Copy URL</button><a class="h-link digest" href="'+digestUrl+'" download title="Download .md">&#x2B07;</a></span>'
+        ? '<span class="digest-btns" style="gap:4px;"><button class="copy-url-btn" style="padding:4px 8px;font-size:11px;" onclick="copyDigestUrl(\\''+digestUrl+'\\', this)">Copy URL</button><a class="h-link digest" href="'+digestUrl+'" download title="Download .md">&#x2B07;</a></span>'
         : '<span class="h-badge no">none</span>';
 
       let audioC;
