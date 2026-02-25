@@ -1137,10 +1137,11 @@ async def _handle_upload(file: UploadFile, date: str, show_id: str):
             )
             upload_path.unlink(missing_ok=True)
             if result.returncode != 0:
-                logger.error("ffmpeg failed (exit %d): %s", result.returncode, result.stderr[:500])
+                logger.error("ffmpeg failed (exit %d): %s", result.returncode, result.stderr[-500:])
                 mp3_path.unlink(missing_ok=True)
+                # Show the last 300 chars of stderr (the actual error, not the banner)
                 return JSONResponse(
-                    {"error": f"Audio conversion failed: {result.stderr[:300]}"},
+                    {"error": f"Audio conversion failed: {result.stderr[-300:].strip()}"},
                     status_code=422,
                 )
             logger.info("Converted %s to MP3 (%d bytes)", ext, mp3_path.stat().st_size)
