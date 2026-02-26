@@ -21,7 +21,11 @@ def _ffmpeg_path() -> str:
     """Resolve ffmpeg: system PATH first, then bundled imageio-ffmpeg fallback."""
     path = shutil.which("ffmpeg")
     if path:
-        return path
+        try:
+            subprocess.run([path, "-version"], capture_output=True, timeout=5)
+            return path
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     try:
         import imageio_ffmpeg
         return imageio_ffmpeg.get_ffmpeg_exe()

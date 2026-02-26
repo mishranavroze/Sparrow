@@ -82,8 +82,10 @@ class TestConvertToMp3:
             result = _convert_to_mp3(src)
 
             assert result == src
-            mock_run.assert_called_once()
-            cmd = mock_run.call_args[0][0]
+            # subprocess.run called twice: once for version check in _ffmpeg_path, once for conversion
+            conversion_call = [c for c in mock_run.call_args_list if "-i" in c[0][0]]
+            assert len(conversion_call) == 1
+            cmd = conversion_call[0][0][0]
             assert "ffmpeg" in cmd[0]
             assert "-codec:a" in cmd
             assert "libmp3lame" in cmd

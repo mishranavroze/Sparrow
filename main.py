@@ -26,7 +26,11 @@ def _ffmpeg_path() -> str:
     """Resolve ffmpeg: system PATH first, then bundled imageio-ffmpeg fallback."""
     path = shutil.which("ffmpeg")
     if path:
-        return path
+        try:
+            subprocess.run([path, "-version"], capture_output=True, timeout=5)
+            return path
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     try:
         import imageio_ffmpeg
         return imageio_ffmpeg.get_ffmpeg_exe()
@@ -1152,12 +1156,12 @@ async def _handle_upload(file: UploadFile, date: str, show_id: str):
                 {"error": "Audio conversion timed out (file may be too large)."},
                 status_code=422,
             )
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError) as e:
             ffpath = _ffmpeg_path()
-            logger.error("ffmpeg not found. Resolved path: %s, which: %s", ffpath, shutil.which("ffmpeg"))
+            logger.error("ffmpeg error: %s. Resolved path: %s, which: %s", e, ffpath, shutil.which("ffmpeg"))
             upload_path.unlink(missing_ok=True)
             return JSONResponse(
-                {"error": f"ffmpeg not found (path={ffpath}). Cannot convert audio."},
+                {"error": f"ffmpeg unavailable (path={ffpath}): {e}. Cannot convert audio."},
                 status_code=500,
             )
 
