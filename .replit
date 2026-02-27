@@ -79,3 +79,8 @@ args = "python -m pytest tests/ -v"
 
 [agent]
 expertMode = true
+
+[userenv]
+
+[userenv.shared]
+CLAUDE_CONFIG_DIR = "/home/runner/workspace/.claude-user"
