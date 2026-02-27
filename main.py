@@ -857,20 +857,6 @@ def _serve_episode(episodes_dir: Path, filename: str, request: Request) -> Respo
 
 # --- Generation & Preparation ---
 
-@app.post("/api/generate")
-async def api_generate(show_id: str = Query(default="")):
-    """Manually trigger digest preparation."""
-    state = _resolve_show(show_id)
-
-    if state.generation_lock.locked():
-        return JSONResponse(
-            {"status": "already_running", "message": "Digest preparation is already in progress."},
-            status_code=409,
-        )
-
-    asyncio.create_task(_run_generation(state))
-    return JSONResponse({"status": "started", "message": "Digest preparation started."})
-
 
 @app.get("/api/cron/generate")
 async def api_cron_generate(secret: str = Query(""), show_id: str = Query(default="")):
