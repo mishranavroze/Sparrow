@@ -44,3 +44,6 @@ token.json
 
 # Debug screenshots
 output/debug/
+
+# Claude Code config
+.claude-user/
