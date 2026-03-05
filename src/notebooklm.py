@@ -1,6 +1,7 @@
 """Playwright automation for NotebookLM Audio Overview generation."""
 
 import asyncio
+import glob as _glob
 import logging
 from pathlib import Path
 
@@ -24,10 +25,20 @@ AUDIO_GENERATION_TIMEOUT = 900  # 15 minutes in seconds
 AUDIO_POLL_INTERVAL = 15  # seconds
 
 # Nix-provided Chromium (has all required system libs)
-NIX_CHROMIUM_PATH = (
+_HARDCODED_NIX_CHROMIUM = (
     "/nix/store/kcvsxrmgwp3ffz5jijyy7wn9fcsjl4hz-playwright-browsers-1.55.0-with-cjk"
     "/chromium-1187/chrome-linux/chrome"
 )
+
+
+def _find_nix_chromium() -> str | None:
+    """Find Chromium in the Nix store dynamically (survives Nix updates)."""
+    pattern = "/nix/store/*-playwright-browsers-*/chromium-*/chrome-linux/chrome"
+    matches = sorted(_glob.glob(pattern))
+    return matches[-1] if matches else None
+
+
+NIX_CHROMIUM_PATH = _find_nix_chromium() or _HARDCODED_NIX_CHROMIUM
 
 
 class NotebookLMAutomator:

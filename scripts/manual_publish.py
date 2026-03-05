@@ -15,7 +15,7 @@ from pathlib import Path
 # Ensure project root is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config import shows
+from config import DEFAULT_SHOW_ID, shows
 from src import database, episode_manager, feed_builder
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -72,7 +72,7 @@ def main():
     parser.add_argument("date", help="Episode date (YYYY-MM-DD)")
     parser.add_argument("audio", help="Path to audio file (e.g. .m4a)")
     parser.add_argument("digest", help="Path to digest markdown file")
-    parser.add_argument("--show", default="hootline", help="Show ID (default: hootline)")
+    parser.add_argument("--show", default=DEFAULT_SHOW_ID, help=f"Show ID (default: {DEFAULT_SHOW_ID})")
     args = parser.parse_args()
 
     date_str = args.date

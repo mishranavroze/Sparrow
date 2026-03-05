@@ -15,7 +15,7 @@ from src.models import EpisodeMetadata
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_EPISODES_DIR = Path("output/episodes")
+DEFAULT_EPISODES_DIR = Path("output/default/episodes")
 
 def _ffmpeg_path() -> str:
     """Resolve ffmpeg: system PATH first, then bundled imageio-ffmpeg fallback."""

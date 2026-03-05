@@ -1,0 +1,15 @@
+{
+  "default_show": "sparrow",
+  "app_title": "Noctua Podcast Platform",
+  "shows": {
+    "sparrow": {
+      "podcast_title": "The Morning Sparrow",
+      "podcast_description": "Your morning knowledge briefing.",
+      "segments": [["Indian Politics", 2], ["Entertainment", 2]],
+      "intro_minutes": 0.5,
+      "outro_minutes": 0.5,
+      "icon_filename": "noctua_owl.png",
+      "weather_location": ""
+    }
+  }
+}

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-from config import ShowConfig, ShowFormat, SHOW_FORMATS
+from config import LOCAL_TZ, ShowConfig, ShowFormat, SHOW_FORMATS
 from src.exceptions import DigestCompileError
 from src.models import Article, CompiledDigest, DailyDigest
 from src.topic_classifier import SEGMENT_DURATIONS, SEGMENT_ORDER, Topic
@@ -23,8 +23,7 @@ WORDS_PER_MINUTE = 150
 PODCAST_PREAMBLE = """\
 **PODCAST PRODUCTION INSTRUCTIONS:**
 This is a pre-written podcast script for "{podcast_name}".
-- Start with a warm welcome, mention today's date ({date}), and briefly \
-mention the weather in Seattle
+- Start with a warm welcome, mention today's date ({date}){weather_instruction}
 - The script flows as a continuous narrative — do NOT announce topic \
 changes mechanically ("now let's talk about...")
 - Blend between topics with natural transitions and conversational bridges
@@ -64,11 +63,13 @@ like "[Host 1]:". Write as flowing prose that two hosts can naturally \
 discuss. Stay within the word budget."""
 
 
-def _fetch_seattle_weather() -> str:
-    """Fetch current Seattle weather from wttr.in. Returns a brief description or empty string."""
+def _fetch_weather(location: str) -> str:
+    """Fetch current weather for a location from wttr.in. Returns a brief description or empty string."""
+    if not location:
+        return ""
     try:
         resp = requests.get(
-            "https://wttr.in/Seattle?format=j1",
+            f"https://wttr.in/{location}?format=j1",
             timeout=5,
             headers={"User-Agent": "NoctuaPodcast/1.0"},
         )
@@ -77,9 +78,9 @@ def _fetch_seattle_weather() -> str:
         current = data["current_condition"][0]
         temp_f = current["temp_F"]
         desc = current["weatherDesc"][0]["value"]
-        return f"It's {temp_f}\u00b0F and {desc.lower()} here in Seattle. "
+        return f"It's {temp_f}\u00b0F and {desc.lower()} in {location}. "
     except Exception as e:
-        logger.warning("Weather fetch failed: %s — skipping weather", e)
+        logger.warning("Weather fetch failed for %s: %s — skipping weather", location, e)
         return ""
 
 
@@ -102,14 +103,14 @@ def _summarize_all_segments(
     grouped: dict[str, list[Article]],
     segment_word_budgets: dict[str, int],
     segment_order: list[str],
-    podcast_name: str = "The Hootline",
+    podcast_name: str = "Podcast",
 ) -> tuple[dict[str, str], str] | None:
     """Summarize all segments and generate RSS summary in a single API call.
 
     Returns (segment_texts, rss_summary) or None if the call fails.
     """
-    from src.llm_client import call_sonnet
-    from src.exceptions import ClaudeAPIError
+    from src.llm_client import call_extended
+    from src.exceptions import LLMAPIError
 
     system_prompt = SUMMARIZATION_SYSTEM_PROMPT_TEMPLATE.format(podcast_name=podcast_name)
 
@@ -160,14 +161,14 @@ def _summarize_all_segments(
     )
 
     try:
-        response = call_sonnet(
+        response = call_extended(
             system=system_prompt,
             user_message=user_message,
             max_tokens=total_word_budget * 3 + 100,
             temperature=0.3,
             timeout=120,
         )
-    except ClaudeAPIError as e:
+    except LLMAPIError as e:
         logger.warning("Single-call summarization failed: %s — using raw fallback", e)
         return None
 
@@ -265,8 +266,8 @@ def _raw_fallback_segment(articles: list[Article], word_budget: int) -> str:
 
 
 def _compile_text(
-    digest: DailyDigest, date_str: str, podcast_name: str = "The Hootline",
-    show_format: ShowFormat | None = None,
+    digest: DailyDigest, date_str: str, podcast_name: str = "Podcast",
+    show_format: ShowFormat | None = None, weather_location: str = "",
 ) -> tuple[str, dict[str, int], dict[str, list[str]], str]:
     """Compile articles into a segment-structured markdown document with AI summaries.
 
@@ -321,8 +322,12 @@ def _compile_text(
         ai_segments = {}
         rss_summary = f"Your daily knowledge briefing from {podcast_name}."
 
-    # Fetch weather for intro
-    weather = _fetch_seattle_weather()
+    # Fetch weather for intro (config-driven location)
+    weather = _fetch_weather(weather_location)
+    weather_instruction = (
+        f", and briefly mention the weather in {weather_location}"
+        if weather_location else ""
+    )
 
     # Choose intro/outro based on show duration
     is_short = show_format and show_format.intro_minutes < 1
@@ -334,7 +339,9 @@ def _compile_text(
                                      intro_dur=int(show_format.intro_minutes) if show_format else 1)
         outro = OUTRO_SECTION.format(podcast_name=podcast_name,
                                      outro_dur=int(show_format.outro_minutes) if show_format else 1)
-    preamble = PODCAST_PREAMBLE.format(podcast_name=podcast_name, date=date_str)
+    preamble = PODCAST_PREAMBLE.format(
+        podcast_name=podcast_name, date=date_str, weather_instruction=weather_instruction,
+    )
 
     sections = [f"# {podcast_name} — Daily Briefing — {date_str}\n"]
     sections.append(preamble)
@@ -390,23 +397,24 @@ def compile(digest: DailyDigest, show: ShowConfig | None = None) -> CompiledDige
 
     Args:
         digest: The daily digest containing articles to compile.
-        show: Show-specific config for podcast name. Falls back to "The Hootline".
+        show: Show-specific config for podcast name and format.
     """
     if not digest.articles:
         raise DigestCompileError("No articles to compile.")
 
-    podcast_name = show.podcast_title if show else "The Hootline"
+    podcast_name = show.podcast_title if show else "Podcast"
 
-    PST = timezone(timedelta(hours=-8))
-    episode_date = datetime.now(PST).date()
+    episode_date = datetime.now(LOCAL_TZ).date()
     date_ymd = episode_date.strftime("%Y-%m-%d")
     date_display = episode_date.strftime("%B %-d, %Y")
 
     show_format = show.format if show else None
+    weather_location = show.weather_location if show else ""
 
     try:
         text, segment_counts, segment_sources, rss_summary = _compile_text(
             digest, date_display, podcast_name=podcast_name, show_format=show_format,
+            weather_location=weather_location,
         )
         topics_summary = _build_topics_summary(digest, segment_counts, show_format=show_format)
         total_words = len(text.split())

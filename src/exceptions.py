@@ -37,8 +37,12 @@ class EpisodeProcessError(NoctuaError):
     """Raised when processing a downloaded episode fails."""
 
 
-class ClaudeAPIError(NoctuaError):
-    """Raised when a Claude API call fails."""
+class LLMAPIError(NoctuaError):
+    """Raised when an LLM API call fails."""
+
+
+# Backward compatibility alias
+ClaudeAPIError = LLMAPIError
 
 
 class FeedBuildError(NoctuaError):

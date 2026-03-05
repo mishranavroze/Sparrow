@@ -3,8 +3,8 @@
 Usage:
     python scripts/gmail_auth.py [show_id]
 
-    show_id: optional, e.g. "hootline" or "sparrow".
-             When SHOW_IDS is configured, defaults to the first show.
+    show_id: optional, e.g. a show ID defined in shows.json.
+             Defaults to the first configured show.
 
 This will print a URL. Open it in your browser, sign in, grant access.
 After authorization, your browser will redirect to a localhost URL that

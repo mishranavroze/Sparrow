@@ -11,7 +11,24 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
+from config import ShowConfig
 from src import database
+
+
+def _make_show(tmp_path: Path) -> ShowConfig:
+    """Create a minimal ShowConfig pointing at tmp_path."""
+    return ShowConfig(
+        show_id="sparrow",
+        podcast_title="Sparrow",
+        podcast_description="Test show",
+        gmail_credentials_json="{}",
+        gmail_token_json="{}",
+        gmail_label="newsletter",
+        notebooklm_notebook_url="https://example.com",
+        google_account_email="test@example.com",
+        google_account_password="password",
+        output_dir=tmp_path,
+    )
 
 
 def _make_mp3_bytes() -> bytes:
@@ -43,32 +60,28 @@ def client(tmp_path):
     """Create a test client with patched paths and reset preparation state."""
     import main
 
-    episodes_dir = tmp_path / "episodes"
-    episodes_dir.mkdir()
-    exports_dir = tmp_path / "exports"
-    exports_dir.mkdir()
-    db_path = tmp_path / "test.db"
-
-    # Reset preparation state before each test
-    main._preparation_active = False
-    main._preparation_date = None
-    main._preparation_cancelled = False
-    main._generation_running = False
-    main._preparation_digest = None
-    main._preparation_error = None
+    show = _make_show(tmp_path)
+    show.episodes_dir.mkdir(parents=True)
+    show.exports_dir.mkdir(parents=True)
 
     with (
-        patch("main.EPISODES_DIR", episodes_dir),
-        patch("main.EXPORTS_DIR", exports_dir),
-        patch("main.EPISODES_JSON", tmp_path / "episodes.json"),
-        patch("main.FEED_PATH", tmp_path / "feed.xml"),
-        patch.object(database, "DB_PATH", db_path),
+        patch("main.shows", {show.show_id: show}),
+        patch.object(database, "DEFAULT_DB_PATH", show.db_path),
         patch("main._missed_todays_run", return_value=False),
         patch("main._maybe_monday_cleanup"),
     ):
         from main import app
         with TestClient(app) as c:
-            yield c, episodes_dir, tmp_path
+            # Get the ShowState created by lifespan
+            state = main._show_states[show.show_id]
+            # Reset preparation state before each test
+            state.preparation_active = False
+            state.preparation_date = None
+            state.preparation_cancelled = False
+            state.generation_running = False
+            state.preparation_digest = None
+            state.preparation_error = None
+            yield c, show.episodes_dir, tmp_path, state
 
 
 # --- database.delete_digest ---
@@ -76,7 +89,7 @@ def client(tmp_path):
 def test_database_delete_digest(tmp_path):
     """Unit test for the new delete_digest function."""
     db_path = tmp_path / "test.db"
-    with patch.object(database, "DB_PATH", db_path):
+    with patch.object(database, "DEFAULT_DB_PATH", db_path):
         # No digest to delete
         assert database.delete_digest("2099-01-01") is False
 
@@ -93,7 +106,7 @@ def test_database_delete_digest(tmp_path):
 def test_database_delete_episode(tmp_path):
     """Unit test for the new delete_episode function."""
     db_path = tmp_path / "test.db"
-    with patch.object(database, "DB_PATH", db_path):
+    with patch.object(database, "DEFAULT_DB_PATH", db_path):
         assert database.delete_episode("2099-01-01") is False
 
         database.save_episode("2099-01-01", 5000000, 1200, "00:20:00", "Topics")
@@ -105,7 +118,7 @@ def test_database_delete_episode(tmp_path):
 def test_database_save_digest_force(tmp_path):
     """save_digest with force=True bypasses episode lock."""
     db_path = tmp_path / "test.db"
-    with patch.object(database, "DB_PATH", db_path):
+    with patch.object(database, "DEFAULT_DB_PATH", db_path):
         database.save_digest("2099-01-01", "Original", 5, 500, "Topics A")
         database.save_episode("2099-01-01", 5000000, 1200, "00:20:00", "Topics A")
 
@@ -122,7 +135,7 @@ def test_database_save_digest_force(tmp_path):
 
 def test_start_preparation_no_digest(client):
     """Starting preparation without existing digest triggers generation."""
-    c, episodes_dir, tmp_path = client
+    c, episodes_dir, tmp_path, state = client
 
     async def noop():
         pass
@@ -139,8 +152,7 @@ def test_start_preparation_no_digest(client):
     assert data["state"] == "generating"
     assert data["date"] == "2099-03-15"
 
-    import main
-    assert main._preparation_active is True
+    assert state.preparation_active is True
 
 
 def test_start_preparation_existing_digest(client):
@@ -148,7 +160,7 @@ def test_start_preparation_existing_digest(client):
 
     Existing digest in DB should be untouched (not deleted).
     """
-    c, episodes_dir, tmp_path = client
+    c, episodes_dir, tmp_path, state = client
 
     database.save_digest("2099-03-15", "Old digest", 10, 1000, "Topics A")
 
@@ -174,8 +186,7 @@ def test_start_preparation_with_existing_episode(client):
 
     Existing episode + digest in DB and RSS stay untouched until Publish.
     """
-    c, episodes_dir, tmp_path = client
-    import main
+    c, episodes_dir, tmp_path, state = client
 
     database.save_digest("2099-03-15", "Old digest", 5, 500, "Topics")
     database.save_episode("2099-03-15", 5000000, 1200, "00:20:00", "Topics")
@@ -200,7 +211,7 @@ def test_start_preparation_with_existing_episode(client):
     assert database.has_episode("2099-03-15") is True
     # MP3 should still exist
     assert old_mp3.exists()
-    assert main._preparation_active is True
+    assert state.preparation_active is True
 
 
 # --- POST /api/upload-episode (now preview mode) ---
@@ -210,7 +221,7 @@ def test_upload_returns_metadata_without_publishing(client):
 
     Audio is saved as .prep.mp3 to avoid overwriting existing episode.
     """
-    c, episodes_dir, tmp_path = client
+    c, episodes_dir, tmp_path, state = client
 
     database.save_digest("2099-03-15", "Test digest", 10, 1000, "Topics")
 
@@ -235,7 +246,7 @@ def test_upload_returns_metadata_without_publishing(client):
     assert data["episode"]["date"] == "2099-03-15"
     assert data["episode"]["duration_formatted"] == "00:02:00"
     # Audio saved as .prep.mp3
-    assert data["episode"]["audio_url"] == "/episodes/noctua-2099-03-15.prep.mp3"
+    assert data["episode"]["audio_url"] == "/sparrow/episodes/noctua-2099-03-15.prep.mp3"
 
     # Prep MP3 should exist on disk
     assert (episodes_dir / "noctua-2099-03-15.prep.mp3").exists()
@@ -243,26 +254,27 @@ def test_upload_returns_metadata_without_publishing(client):
     # Episode should NOT be in the database
     assert database.has_episode("2099-03-15") is False
 
-    # episodes.json should NOT exist or be empty
+    # episodes.json should be empty (no episodes added)
     episodes_json = tmp_path / "episodes.json"
-    assert not episodes_json.exists()
+    if episodes_json.exists():
+        import json
+        assert json.loads(episodes_json.read_text()) == []
 
 
 # --- POST /api/publish-episode ---
 
 def test_publish_adds_to_rss_and_db(client):
     """Publishing should add episode to DB and RSS, and clear preparation state."""
-    c, episodes_dir, tmp_path = client
-    import main
+    c, episodes_dir, tmp_path, state = client
 
     # Set up in-memory preparation digest (not in DB)
     digest = _make_compiled_digest(
         date="2099-03-15", text="New digest", article_count=10,
         total_words=1000, topics_summary="Topics A", rss_summary="Test summary",
     )
-    main._preparation_active = True
-    main._preparation_date = "2099-03-15"
-    main._preparation_digest = digest
+    state.preparation_active = True
+    state.preparation_date = "2099-03-15"
+    state.preparation_digest = digest
 
     # Create prep MP3 on disk (not canonical)
     prep_mp3 = episodes_dir / "noctua-2099-03-15.prep.mp3"
@@ -292,8 +304,8 @@ def test_publish_adds_to_rss_and_db(client):
     assert "published" in data["message"].lower()
 
     # Preparation state should be cleared
-    assert main._preparation_active is False
-    assert main._preparation_digest is None
+    assert state.preparation_active is False
+    assert state.preparation_digest is None
 
     # Prep MP3 should be renamed to canonical
     assert not prep_mp3.exists()
@@ -311,18 +323,17 @@ def test_publish_adds_to_rss_and_db(client):
 
 def test_publish_no_digest(client):
     """Publishing without an in-memory digest should return 404."""
-    c, episodes_dir, tmp_path = client
+    c, episodes_dir, tmp_path, state = client
     res = c.post("/api/publish-episode", data={"date": "2099-03-15"})
     assert res.status_code == 404
 
 
 def test_publish_no_mp3(client):
     """Publishing without a prep MP3 on disk should return 404."""
-    c, episodes_dir, tmp_path = client
-    import main
+    c, episodes_dir, tmp_path, state = client
 
     # Set in-memory digest but no prep MP3
-    main._preparation_digest = _make_compiled_digest()
+    state.preparation_digest = _make_compiled_digest()
     res = c.post("/api/publish-episode", data={"date": "2099-03-15"})
     assert res.status_code == 404
 
@@ -334,8 +345,7 @@ def test_cancel_cleans_up_prep_only(client):
 
     Existing digest and episode in DB should be untouched.
     """
-    c, episodes_dir, tmp_path = client
-    import main
+    c, episodes_dir, tmp_path, state = client
 
     # Existing data in DB (should be preserved)
     database.save_digest("2099-03-15", "Test digest", 10, 1000, "Topics")
@@ -348,16 +358,16 @@ def test_cancel_cleans_up_prep_only(client):
     canonical_mp3 = episodes_dir / "noctua-2099-03-15.mp3"
     canonical_mp3.write_bytes(b"existing episode audio")
 
-    main._preparation_active = True
-    main._preparation_date = "2099-03-15"
-    main._preparation_digest = _make_compiled_digest()
+    state.preparation_active = True
+    state.preparation_date = "2099-03-15"
+    state.preparation_digest = _make_compiled_digest()
 
     res = c.post("/api/cancel-preparation")
 
     assert res.status_code == 200
-    assert main._preparation_active is False
-    assert main._preparation_date is None
-    assert main._preparation_digest is None
+    assert state.preparation_active is False
+    assert state.preparation_date is None
+    assert state.preparation_digest is None
 
     # Digest should still exist in DB
     assert database.get_digest("2099-03-15") is not None
@@ -371,30 +381,28 @@ def test_cancel_cleans_up_prep_only(client):
 
 def test_cancel_during_generation(client):
     """Cancel during generation should set the cancelled flag."""
-    c, episodes_dir, tmp_path = client
-    import main
+    c, episodes_dir, tmp_path, state = client
 
-    main._preparation_active = True
-    main._preparation_date = "2099-03-15"
-    main._generation_running = True
+    state.preparation_active = True
+    state.preparation_date = "2099-03-15"
+    state.generation_running = True
 
     res = c.post("/api/cancel-preparation")
 
     assert res.status_code == 200
-    assert main._preparation_cancelled is True
-    assert main._preparation_active is False
+    assert state.preparation_cancelled is True
+    assert state.preparation_active is False
 
 
 def test_cancel_preserves_published_episode(client):
     """Cancel should not touch a digest or episode that exists in DB."""
-    c, episodes_dir, tmp_path = client
-    import main
+    c, episodes_dir, tmp_path, state = client
 
     database.save_digest("2099-03-15", "Locked digest", 10, 1000, "Topics")
     database.save_episode("2099-03-15", 5000000, 1200, "00:20:00", "Topics")
 
-    main._preparation_active = True
-    main._preparation_date = "2099-03-15"
+    state.preparation_active = True
+    state.preparation_date = "2099-03-15"
 
     res = c.post("/api/cancel-preparation")
 
@@ -408,13 +416,12 @@ def test_cancel_preserves_published_episode(client):
 
 def test_latest_includes_preparation_state(client):
     """Latest episode response should include preparation field when active."""
-    c, episodes_dir, tmp_path = client
-    import main
+    c, episodes_dir, tmp_path, state = client
 
     # Set in-memory preparation digest (not DB)
-    main._preparation_active = True
-    main._preparation_date = "2099-03-15"
-    main._preparation_digest = _make_compiled_digest()
+    state.preparation_active = True
+    state.preparation_date = "2099-03-15"
+    state.preparation_digest = _make_compiled_digest()
 
     res = c.get("/api/latest-episode")
     data = res.json()
@@ -428,10 +435,9 @@ def test_latest_includes_preparation_state(client):
 
 def test_latest_preparation_null_when_inactive(client):
     """Latest episode response should have preparation=null when not active."""
-    c, episodes_dir, tmp_path = client
-    import main
+    c, episodes_dir, tmp_path, state = client
 
-    main._preparation_active = False
+    state.preparation_active = False
 
     res = c.get("/api/latest-episode")
     data = res.json()
@@ -441,12 +447,11 @@ def test_latest_preparation_null_when_inactive(client):
 
 def test_latest_preparation_audio_uploaded(client):
     """Latest with prep active + prep MP3 on disk should show audio_uploaded state."""
-    c, episodes_dir, tmp_path = client
-    import main
+    c, episodes_dir, tmp_path, state = client
 
-    main._preparation_active = True
-    main._preparation_date = "2099-03-15"
-    main._preparation_digest = _make_compiled_digest()
+    state.preparation_active = True
+    state.preparation_date = "2099-03-15"
+    state.preparation_digest = _make_compiled_digest()
 
     # Create prep MP3 (not canonical)
     prep_mp3 = episodes_dir / "noctua-2099-03-15.prep.mp3"
@@ -457,17 +462,16 @@ def test_latest_preparation_audio_uploaded(client):
 
     assert data["preparation"]["state"] == "audio_uploaded"
     assert data["preparation"]["audio"] is not None
-    assert data["preparation"]["audio"]["audio_url"] == "/episodes/noctua-2099-03-15.prep.mp3"
+    assert data["preparation"]["audio"]["audio_url"] == "/sparrow/episodes/noctua-2099-03-15.prep.mp3"
 
 
 def test_latest_preparation_generating(client):
     """Latest with prep active + generation running should show generating state."""
-    c, episodes_dir, tmp_path = client
-    import main
+    c, episodes_dir, tmp_path, state = client
 
-    main._preparation_active = True
-    main._preparation_date = "2099-03-15"
-    main._generation_running = True
+    state.preparation_active = True
+    state.preparation_date = "2099-03-15"
+    state.generation_running = True
 
     res = c.get("/api/latest-episode")
     data = res.json()
@@ -478,15 +482,14 @@ def test_latest_preparation_generating(client):
 
 def test_latest_preparation_existing_episode_flag(client):
     """Preparation response should include existing_episode flag when applicable."""
-    c, episodes_dir, tmp_path = client
-    import main
+    c, episodes_dir, tmp_path, state = client
 
     # Published episode exists in DB
     database.save_episode("2099-03-15", 5000000, 1200, "00:20:00", "Topics")
 
-    main._preparation_active = True
-    main._preparation_date = "2099-03-15"
-    main._preparation_digest = _make_compiled_digest()
+    state.preparation_active = True
+    state.preparation_date = "2099-03-15"
+    state.preparation_digest = _make_compiled_digest()
 
     res = c.get("/api/latest-episode")
     data = res.json()
@@ -498,10 +501,9 @@ def test_latest_preparation_existing_episode_flag(client):
 
 def test_preparation_digest_download(client):
     """Preparation digest endpoint should serve the in-memory digest."""
-    c, episodes_dir, tmp_path = client
-    import main
+    c, episodes_dir, tmp_path, state = client
 
-    main._preparation_digest = _make_compiled_digest(text="# My Digest\nContent here")
+    state.preparation_digest = _make_compiled_digest(text="# My Digest\nContent here")
 
     res = c.get("/api/preparation-digest")
     assert res.status_code == 200
@@ -511,6 +513,6 @@ def test_preparation_digest_download(client):
 
 def test_preparation_digest_404_when_none(client):
     """Preparation digest endpoint should return 404 when no digest in memory."""
-    c, episodes_dir, tmp_path = client
+    c, episodes_dir, tmp_path, state = client
     res = c.get("/api/preparation-digest")
     assert res.status_code == 404

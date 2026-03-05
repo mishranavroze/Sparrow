@@ -6,7 +6,7 @@ import time
 import requests
 
 from config import settings
-from src.exceptions import ClaudeAPIError
+from src.exceptions import LLMAPIError
 
 logger = logging.getLogger(__name__)
 
@@ -41,12 +41,16 @@ def _call_gemini(
         The generated text.
 
     Raises:
-        ClaudeAPIError: If the API key is missing or all retries fail.
+        LLMAPIError: If the API key is missing or all retries fail.
     """
     if not settings.gemini_api_key:
-        raise ClaudeAPIError("No GEMINI_API_KEY configured")
+        raise LLMAPIError("No GEMINI_API_KEY configured")
 
-    url = f"{API_URL}/{model}:generateContent?key={settings.gemini_api_key}"
+    url = f"{API_URL}/{model}:generateContent"
+    headers = {
+        "content-type": "application/json",
+        "x-goog-api-key": settings.gemini_api_key,
+    }
     payload = {
         "system_instruction": {"parts": [{"text": system}]},
         "contents": [{"parts": [{"text": user_message}]}],
@@ -61,7 +65,7 @@ def _call_gemini(
         try:
             resp = requests.post(
                 url,
-                headers={"content-type": "application/json"},
+                headers=headers,
                 json=payload,
                 timeout=timeout,
             )
@@ -79,8 +83,8 @@ def _call_gemini(
             data = resp.json()
             return data["candidates"][0]["content"]["parts"][0]["text"]
         except requests.exceptions.HTTPError as e:
-            raise ClaudeAPIError(f"Gemini API call failed: {e}") from e
-        except ClaudeAPIError:
+            raise LLMAPIError(f"Gemini API call failed: {e}") from e
+        except LLMAPIError:
             raise
         except Exception as e:
             last_error = str(e)
@@ -93,10 +97,10 @@ def _call_gemini(
                 time.sleep(wait)
             continue
 
-    raise ClaudeAPIError(f"Gemini API failed after {MAX_RETRIES} retries: {last_error}")
+    raise LLMAPIError(f"Gemini API failed after {MAX_RETRIES} retries: {last_error}")
 
 
-def call_haiku(
+def call_fast(
     system: str,
     user_message: str,
     max_tokens: int = 1024,
@@ -107,7 +111,7 @@ def call_haiku(
     return _call_gemini(FLASH_MODEL, system, user_message, max_tokens, temperature, timeout)
 
 
-def call_sonnet(
+def call_extended(
     system: str,
     user_message: str,
     max_tokens: int = 4096,
@@ -116,3 +120,8 @@ def call_sonnet(
 ) -> str:
     """Call Gemini Flash (good for summarization)."""
     return _call_gemini(PRO_MODEL, system, user_message, max_tokens, temperature, timeout)
+
+
+# Backward compatibility aliases
+call_haiku = call_fast
+call_sonnet = call_extended

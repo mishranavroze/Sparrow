@@ -1,7 +1,7 @@
 """Tests for weekly episode lifecycle: helpers, cleanup, and new endpoints.
 
 IMPORTANT: All test dates use 2099 to avoid any collision with real data,
-even if DB_PATH patching were to leak in the Replit environment.
+even if DEFAULT_DB_PATH patching were to leak in the Replit environment.
 """
 
 import json
@@ -9,11 +9,29 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
 
+from config import ShowConfig
 from src import database
+
+
+def _make_show(tmp_path: Path) -> ShowConfig:
+    """Create a minimal ShowConfig pointing at tmp_path."""
+    return ShowConfig(
+        show_id="sparrow",
+        podcast_title="Sparrow",
+        podcast_description="Test show",
+        gmail_credentials_json="{}",
+        gmail_token_json="{}",
+        gmail_label="newsletter",
+        notebooklm_notebook_url="https://example.com",
+        google_account_email="test@example.com",
+        google_account_password="password",
+        output_dir=tmp_path,
+    )
 
 
 # --- PST helper tests (pure functions, no DB) ---
@@ -68,7 +86,7 @@ def test_week_date_range_sunday():
 
 def test_delete_digests_between(tmp_path):
     db_path = tmp_path / "test.db"
-    with patch.object(database, "DB_PATH", db_path):
+    with patch.object(database, "DEFAULT_DB_PATH", db_path):
         database.save_digest("2099-06-02", "Mon", 1, 100, "A")
         database.save_digest("2099-06-03", "Tue", 2, 200, "B")
         database.save_digest("2099-06-04", "Wed", 3, 300, "C")
@@ -87,7 +105,7 @@ def test_delete_digests_between(tmp_path):
 def test_save_digest_locked_by_episode(tmp_path):
     """save_digest refuses to overwrite when an episode exists for that date."""
     db_path = tmp_path / "test.db"
-    with patch.object(database, "DB_PATH", db_path):
+    with patch.object(database, "DEFAULT_DB_PATH", db_path):
         # Save initial digest
         database.save_digest("2099-06-02", "Original content", 5, 500, "Topics A")
 
@@ -105,7 +123,7 @@ def test_save_digest_locked_by_episode(tmp_path):
 
 def test_has_episode(tmp_path):
     db_path = tmp_path / "test.db"
-    with patch.object(database, "DB_PATH", db_path):
+    with patch.object(database, "DEFAULT_DB_PATH", db_path):
         assert database.has_episode("2099-06-02") is False
         database.save_episode("2099-06-02", 5000000, 1200, "00:20:00", "Topics")
         assert database.has_episode("2099-06-02") is True
@@ -113,7 +131,7 @@ def test_has_episode(tmp_path):
 
 def test_delete_digests_between_empty(tmp_path):
     db_path = tmp_path / "test.db"
-    with patch.object(database, "DB_PATH", db_path):
+    with patch.object(database, "DEFAULT_DB_PATH", db_path):
         deleted = database.delete_digests_between("2099-01-01", "2099-01-07")
         assert deleted == 0
 
@@ -127,8 +145,8 @@ def test_clear_feed(tmp_path):
     feed_path = tmp_path / "feed.xml"
 
     with (
-        patch("src.feed_builder.EPISODES_JSON", json_path),
-        patch("src.feed_builder.FEED_PATH", feed_path),
+        patch("src.feed_builder.DEFAULT_EPISODES_JSON", json_path),
+        patch("src.feed_builder.DEFAULT_FEED_PATH", feed_path),
     ):
         # Seed with an episode
         _save_episode_catalog([{
@@ -150,42 +168,41 @@ def test_clear_feed(tmp_path):
 # --- Monday cleanup ---
 
 def test_monday_cleanup(tmp_path):
-    """Full Monday cleanup: archive, delete MP3s, clear feed, delete digests."""
-    from main import _monday_cleanup
+    """Full Monday cleanup: archive last week's MP3s, delete them, delete digests."""
+    from main import ShowState, _monday_cleanup
 
-    episodes_dir = tmp_path / "episodes"
-    episodes_dir.mkdir()
-    exports_dir = tmp_path / "exports"
+    show = _make_show(tmp_path)
+    episodes_dir = show.episodes_dir
+    episodes_dir.mkdir(parents=True)
 
     # Scenario: it's Monday 2099-06-09, last week is 2099-06-02 to 2099-06-08
     # Create last week's MP3s
     for day in range(2, 7):
         (episodes_dir / f"noctua-2099-06-{day:02d}.mp3").write_bytes(b"fake mp3 data")
 
-    # Also a current week MP3 that should still be deleted (cleanup deletes ALL mp3s)
+    # Current week MP3 should NOT be deleted (cleanup only removes last week)
     (episodes_dir / "noctua-2099-06-09.mp3").write_bytes(b"current week")
 
-    db_path = tmp_path / "test.db"
+    db_path = show.db_path
 
     # Patch _pst_now to return Monday 2099-06-09
-    mock_now = datetime(2099, 6, 9, 10, 0, 0, tzinfo=timezone(timedelta(hours=-8)))
+    mock_now = datetime(2099, 6, 9, 10, 0, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+
+    state = ShowState(show=show)
 
     with (
-        patch("main.EPISODES_DIR", episodes_dir),
-        patch("main.EXPORTS_DIR", exports_dir),
         patch("main._pst_now", return_value=mock_now),
-        patch("src.feed_builder.EPISODES_JSON", tmp_path / "episodes.json"),
-        patch("src.feed_builder.FEED_PATH", tmp_path / "feed.xml"),
-        patch.object(database, "DB_PATH", db_path),
+        patch.object(database, "DEFAULT_DB_PATH", db_path),
     ):
         # Save digests for last week
-        database.save_digest("2099-06-02", "Day", 1, 100, "A")
-        database.save_digest("2099-06-03", "Day", 2, 200, "B")
+        database.save_digest("2099-06-02", "Day", 1, 100, "A", db_path=db_path)
+        database.save_digest("2099-06-03", "Day", 2, 200, "B", db_path=db_path)
 
-        _monday_cleanup()
+        _monday_cleanup(state)
 
         # ZIP should exist for last week (W23-2099)
-        zip_path = exports_dir / "hootline-W23-2099.zip"
+        exports_dir = show.exports_dir
+        zip_path = exports_dir / "sparrow-W23-2099.zip"
         assert zip_path.exists()
         with zipfile.ZipFile(zip_path) as zf:
             names = zf.namelist()
@@ -195,12 +212,14 @@ def test_monday_cleanup(tmp_path):
             assert "noctua-digest-2099-06-02.md" in names
             assert "noctua-digest-2099-06-03.md" in names
 
-        # All MP3s should be deleted
-        assert list(episodes_dir.glob("noctua-*.mp3")) == []
+        # Last week's MP3s should be deleted, current week kept
+        remaining = list(episodes_dir.glob("noctua-*.mp3"))
+        assert len(remaining) == 1
+        assert remaining[0].name == "noctua-2099-06-09.mp3"
 
         # Digests for last week should be deleted
-        assert database.get_digest("2099-06-02") is None
-        assert database.get_digest("2099-06-03") is None
+        assert database.get_digest("2099-06-02", db_path=db_path) is None
+        assert database.get_digest("2099-06-03", db_path=db_path) is None
 
 
 # --- API endpoint tests ---
@@ -208,31 +227,26 @@ def test_monday_cleanup(tmp_path):
 @pytest.fixture
 def client(tmp_path):
     """Create a test client with patched paths."""
-    episodes_dir = tmp_path / "episodes"
-    episodes_dir.mkdir()
-    exports_dir = tmp_path / "exports"
-    exports_dir.mkdir()
-    db_path = tmp_path / "test.db"
+    show = _make_show(tmp_path)
+    show.episodes_dir.mkdir(parents=True)
+    show.exports_dir.mkdir(parents=True)
 
     with (
-        patch("main.EPISODES_DIR", episodes_dir),
-        patch("main.EXPORTS_DIR", exports_dir),
-        patch("main.EPISODES_JSON", tmp_path / "episodes.json"),
-        patch("main.FEED_PATH", tmp_path / "feed.xml"),
-        patch.object(database, "DB_PATH", db_path),
+        patch("main.shows", {show.show_id: show}),
+        patch.object(database, "DEFAULT_DB_PATH", show.db_path),
         patch("main._missed_todays_run", return_value=False),
         patch("main._maybe_monday_cleanup"),
     ):
         from main import app
         with TestClient(app) as c:
-            yield c, episodes_dir, exports_dir
+            yield c, show.episodes_dir, show.exports_dir
 
 
 def test_export_episodes_creates_weekly_zip(client):
     c, episodes_dir, exports_dir = client
 
     # Patch _pst_now to Wednesday 2099-06-04
-    mock_now = datetime(2099, 6, 4, 12, 0, 0, tzinfo=timezone(timedelta(hours=-8)))
+    mock_now = datetime(2099, 6, 4, 12, 0, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
 
     # Create MP3s for this week (2099-06-02 Mon to 2099-06-08 Sun)
     (episodes_dir / "noctua-2099-06-02.mp3").write_bytes(b"mon")
@@ -251,7 +265,7 @@ def test_export_episodes_creates_weekly_zip(client):
     assert "W23-2099" in res.headers["content-disposition"]
 
     # ZIP should be cached on disk with MP3s + digests
-    zip_path = exports_dir / "hootline-W23-2099.zip"
+    zip_path = exports_dir / "sparrow-W23-2099.zip"
     assert zip_path.exists()
     with zipfile.ZipFile(zip_path) as zf:
         names = zf.namelist()
@@ -262,7 +276,7 @@ def test_export_episodes_creates_weekly_zip(client):
 
 def test_export_episodes_no_episodes(client):
     c, episodes_dir, exports_dir = client
-    mock_now = datetime(2099, 6, 4, 12, 0, 0, tzinfo=timezone(timedelta(hours=-8)))
+    mock_now = datetime(2099, 6, 4, 12, 0, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
     with patch("main._pst_now", return_value=mock_now):
         res = c.get("/api/export-episodes")
     assert res.status_code == 404
@@ -272,7 +286,7 @@ def test_export_weeks(client):
     c, episodes_dir, exports_dir = client
 
     # Create a pending export ZIP
-    zip_path = exports_dir / "hootline-W22-2099.zip"
+    zip_path = exports_dir / "sparrow-W22-2099.zip"
     with zipfile.ZipFile(zip_path, "w") as zf:
         zf.writestr("noctua-2099-05-26.mp3", "fake")
 
@@ -281,7 +295,7 @@ def test_export_weeks(client):
     data = res.json()
     assert len(data) == 1
     assert data[0]["week_label"] == "W22-2099"
-    assert data[0]["filename"] == "hootline-W22-2099.zip"
+    assert data[0]["filename"] == "sparrow-W22-2099.zip"
     assert data[0]["size_bytes"] > 0
 
 
@@ -289,11 +303,11 @@ def test_download_export_and_delete(client):
     c, episodes_dir, exports_dir = client
 
     # Create a pending export ZIP
-    zip_path = exports_dir / "hootline-W22-2099.zip"
+    zip_path = exports_dir / "sparrow-W22-2099.zip"
     with zipfile.ZipFile(zip_path, "w") as zf:
         zf.writestr("noctua-2099-05-26.mp3", "fake")
 
-    res = c.get("/api/download-export/hootline-W22-2099.zip")
+    res = c.get("/api/download-export/sparrow-W22-2099.zip")
     assert res.status_code == 200
     assert res.headers["content-type"] == "application/zip"
 

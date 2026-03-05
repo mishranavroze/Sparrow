@@ -8,7 +8,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = Path("output/noctua.db")
+DEFAULT_DB_PATH = Path("output/default/noctua.db")
+
+_initialized_dbs: set[str] = set()
 
 
 def _get_connection(db_path: Path | None = None) -> sqlite3.Connection:
@@ -18,7 +20,10 @@ def _get_connection(db_path: Path | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    _create_tables(conn)
+    resolved = str(path.resolve())
+    if resolved not in _initialized_dbs:
+        _create_tables(conn)
+        _initialized_dbs.add(resolved)
     return conn
 
 
@@ -67,28 +72,33 @@ def _create_tables(conn: sqlite3.Connection) -> None:
     # Migrate: add rss_summary column if missing (existing DBs)
     try:
         conn.execute("ALTER TABLE digests ADD COLUMN rss_summary TEXT NOT NULL DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
     # Migrate: add segment_counts column to digests if missing
     try:
         conn.execute("ALTER TABLE digests ADD COLUMN segment_counts TEXT NOT NULL DEFAULT '{}'")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
     # Migrate: add segment_sources column to digests if missing
     try:
         conn.execute("ALTER TABLE digests ADD COLUMN segment_sources TEXT NOT NULL DEFAULT '{}'")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
     # Migrate: add gcs_url column to episodes if missing
     try:
         conn.execute("ALTER TABLE episodes ADD COLUMN gcs_url TEXT NOT NULL DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
     # Migrate: add email_count column to digests if missing
     try:
         conn.execute("ALTER TABLE digests ADD COLUMN email_count INTEGER NOT NULL DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
     conn.commit()
 
 

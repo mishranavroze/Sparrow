@@ -17,11 +17,12 @@ from fastapi import FastAPI, Form, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from config import ShowConfig, ShowFormat, SHOW_FORMATS, settings, shows
+from config import APP_TITLE, DEFAULT_SHOW_ID, LOCAL_TZ, ShowConfig, ShowFormat, SHOW_FORMATS, settings, shows
 from src import database, episode_manager, feed_builder
 from src.models import CompiledDigest
 
 ACCEPTED_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".webm"}
+MAX_UPLOAD_BYTES = 500 * 1024 * 1024  # 500 MB
 def _ffmpeg_path() -> str:
     """Resolve ffmpeg: system PATH first, then bundled imageio-ffmpeg fallback."""
     path = shutil.which("ffmpeg")
@@ -40,12 +41,12 @@ def _ffmpeg_path() -> str:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-PST = timezone(timedelta(hours=-8))
+PST = LOCAL_TZ  # Backward-compatible alias; handles both PST and PDT automatically
 
 
 def _pst_now() -> datetime:
-    """Return the current datetime in PST (UTC-8)."""
-    return datetime.now(PST)
+    """Return the current datetime in Pacific Time (PST/PDT)."""
+    return datetime.now(LOCAL_TZ)
 
 
 def _iso_week_label(dt: datetime) -> str:
@@ -98,10 +99,11 @@ _next_scheduled_run: datetime | None = None
 
 
 def _resolve_show(show_id: str = "") -> ShowState:
-    """Resolve a show_id to its ShowState. Defaults to the first show."""
+    """Resolve a show_id to its ShowState. Defaults to DEFAULT_SHOW_ID."""
     if show_id and show_id in _show_states:
         return _show_states[show_id]
-    # Default to the first configured show
+    if DEFAULT_SHOW_ID in _show_states:
+        return _show_states[DEFAULT_SHOW_ID]
     return next(iter(_show_states.values()))
 
 
@@ -164,19 +166,14 @@ async def _run_generation(state: ShowState) -> None:
         try:
             await _maybe_monday_cleanup(state)
 
-            original_save = database.save_digest
-            database.save_digest = lambda *args, **kwargs: None
-            try:
-                def _run_sync():
-                    loop = asyncio.new_event_loop()
-                    try:
-                        return loop.run_until_complete(generate_digest_only(show=show))
-                    finally:
-                        loop.close()
+            def _run_sync():
+                loop = asyncio.new_event_loop()
+                try:
+                    return loop.run_until_complete(generate_digest_only(show=show, save_to_db=False))
+                finally:
+                    loop.close()
 
-                result = await asyncio.to_thread(_run_sync)
-            finally:
-                database.save_digest = original_save
+            result = await asyncio.to_thread(_run_sync)
 
             if state.preparation_cancelled:
                 state.preparation_digest = None
@@ -307,7 +304,7 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="The Hootline", description="Daily podcast generator", lifespan=lifespan)
+app = FastAPI(title=APP_TITLE, description="Daily podcast generator", lifespan=lifespan)
 
 # Serve static assets (cover image, etc.)
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -405,8 +402,7 @@ async def api_latest_episode(show_id: str = Query(default="")):
     db_path = show.db_path
 
     # Determine URL prefix for episodes
-    is_legacy = show.output_dir == Path("output")
-    ep_url_prefix = "/episodes" if is_legacy else f"/{show.show_id}/episodes"
+    ep_url_prefix = f"/{show.show_id}/episodes"
 
     episode_data = None
     if episodes_json.exists():
@@ -429,10 +425,7 @@ async def api_latest_episode(show_id: str = Query(default="")):
             seg_counts = json.loads(latest_digest.get("segment_counts") or "{}")
 
             # Digest download URL
-            if is_legacy:
-                dl_url = f"/digests/{latest_digest['date']}.md"
-            else:
-                dl_url = f"/{show.show_id}/digests/{latest_digest['date']}.md"
+            dl_url = f"/{show.show_id}/digests/{latest_digest['date']}.md"
 
             digest_meta = {
                 "date": latest_digest["date"],
@@ -606,7 +599,6 @@ async def api_history(show_id: str = Query(default="")):
     show = state.show
     db_path = show.db_path
     episodes_dir = show.episodes_dir
-    is_legacy = show.output_dir == Path("output")
 
     digests = database.list_digests(limit=100, db_path=db_path)
     episodes_list = database.list_episodes(db_path=db_path)
@@ -998,8 +990,7 @@ async def api_publish_episode(date: str = Form(""), show_id: str = Form("")):
     state.preparation_digest = None
 
     # Determine feed URL
-    is_legacy = show.output_dir == Path("output")
-    feed_url = f"{settings.base_url}/feed.xml" if is_legacy else f"{settings.base_url}/{show.show_id}/feed.xml"
+    feed_url = f"{settings.base_url}/{show.show_id}/feed.xml"
 
     return JSONResponse({
         "status": "ok",
@@ -1060,8 +1051,7 @@ async def _handle_upload(file: UploadFile, date: str, show_id: str):
     state = _resolve_show(show_id)
     show = state.show
     episodes_dir = show.episodes_dir
-    is_legacy = show.output_dir == Path("output")
-    ep_url_prefix = "/episodes" if is_legacy else f"/{show.show_id}/episodes"
+    ep_url_prefix = f"/{show.show_id}/episodes"
 
     if not date or not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
         return JSONResponse(
@@ -1101,8 +1091,15 @@ async def _handle_upload(file: UploadFile, date: str, show_id: str):
         total_bytes = 0
         with open(upload_path, "wb") as f:
             while chunk := await file.read(1024 * 1024):  # 1MB chunks
-                f.write(chunk)
                 total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    f.close()
+                    upload_path.unlink(missing_ok=True)
+                    return JSONResponse(
+                        {"error": f"File too large. Maximum size is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB."},
+                        status_code=413,
+                    )
+                f.write(chunk)
         if total_bytes == 0:
             upload_path.unlink(missing_ok=True)
             return JSONResponse(
@@ -1471,7 +1468,7 @@ async function loadShowFormat() {
   // Set correct RSS feed link per show
   const feedLink = document.getElementById('feed-link');
   if (feedLink) {
-    feedLink.href = SHOW_ID === 'hootline' ? '/feed.xml' : '/' + SHOW_ID + '/feed.xml';
+    feedLink.href = '/' + SHOW_ID + '/feed.xml';
   }
 }
 
@@ -1824,16 +1821,20 @@ function drawRadar(topics, hasActual, canvasId) {
 
 // ===== HISTORY TAB =====
 function getWeekRange() {
-  // Compute current PST week (Mon-Sun) using UTC-8
-  const now = new Date(Date.now() - 8*3600000);
-  const day = now.getUTCDay(); // 0=Sun,...,6=Sat
+  // Compute current Pacific Time week (Mon-Sun), handles PST/PDT automatically
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit'
+  });
+  const todayStr = fmt.format(new Date());
+  const now = new Date(todayStr + 'T12:00:00');
+  const day = now.getDay(); // 0=Sun,...,6=Sat
   const diffToMon = day === 0 ? -6 : 1 - day;
   const mon = new Date(now);
-  mon.setUTCDate(mon.getUTCDate() + diffToMon);
+  mon.setDate(mon.getDate() + diffToMon);
   const sun = new Date(mon);
-  sun.setUTCDate(sun.getUTCDate() + 6);
-  const fmt = d => d.toISOString().slice(0,10);
-  return { mon: fmt(mon), sun: fmt(sun) };
+  sun.setDate(sun.getDate() + 6);
+  const fmtDate = d => d.toISOString().slice(0,10);
+  return { mon: fmtDate(mon), sun: fmtDate(sun) };
 }
 
 async function loadHistory() {

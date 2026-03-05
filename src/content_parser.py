@@ -34,6 +34,7 @@ TRACKING_PIXEL_PATTERN = re.compile(
 )
 
 SIMILARITY_THRESHOLD = 0.6
+MIN_CONTENT_LENGTH = 50  # Minimum characters for a valid email body
 
 
 def _clean_html(html: str) -> str:
@@ -157,7 +158,7 @@ def parse_emails(emails: list[EmailMessage]) -> DailyDigest:
             elif email.body_text:
                 content = email.body_text.strip()
 
-            if not content or len(content) < 50:
+            if not content or len(content) < MIN_CONTENT_LENGTH:
                 logger.warning("Skipping email '%s' — too little content", email.subject)
                 continue
 
@@ -173,10 +174,8 @@ def parse_emails(emails: list[EmailMessage]) -> DailyDigest:
             articles.append(article)
 
         except Exception as e:
-            logger.error("Failed to parse email '%s': %s", email.subject, e)
-            raise ContentParseError(
-                f"Failed to parse email '{email.subject}': {e}"
-            ) from e
+            logger.error("Failed to parse email '%s': %s (skipping)", email.subject, e)
+            continue
 
     # Deduplicate before classification (saves AI calls)
     articles = _deduplicate_articles(articles)

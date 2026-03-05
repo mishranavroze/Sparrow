@@ -7,7 +7,7 @@ from src import database
 
 def test_save_and_get_digest(tmp_path):
     db_path = tmp_path / "test.db"
-    with patch.object(database, "DB_PATH", db_path):
+    with patch.object(database, "DEFAULT_DB_PATH", db_path):
         database.save_digest("2026-02-16", "# Digest\n\nContent", 5, 1200, "Topic A; Topic B")
 
         result = database.get_digest("2026-02-16")
@@ -21,7 +21,7 @@ def test_save_and_get_digest(tmp_path):
 
 def test_save_digest_upserts(tmp_path):
     db_path = tmp_path / "test.db"
-    with patch.object(database, "DB_PATH", db_path):
+    with patch.object(database, "DEFAULT_DB_PATH", db_path):
         database.save_digest("2026-02-16", "Old content", 3, 500, "Old topics")
         database.save_digest("2026-02-16", "New content", 7, 2000, "New topics")
 
@@ -32,7 +32,7 @@ def test_save_digest_upserts(tmp_path):
 
 def test_list_digests(tmp_path):
     db_path = tmp_path / "test.db"
-    with patch.object(database, "DB_PATH", db_path):
+    with patch.object(database, "DEFAULT_DB_PATH", db_path):
         database.save_digest("2026-02-14", "Day 1", 2, 400, "A")
         database.save_digest("2026-02-15", "Day 2", 3, 600, "B")
         database.save_digest("2026-02-16", "Day 3", 5, 1000, "C")
@@ -48,13 +48,13 @@ def test_list_digests(tmp_path):
 
 def test_get_digest_not_found(tmp_path):
     db_path = tmp_path / "test.db"
-    with patch.object(database, "DB_PATH", db_path):
+    with patch.object(database, "DEFAULT_DB_PATH", db_path):
         assert database.get_digest("2099-01-01") is None
 
 
 def test_pipeline_run_logging(tmp_path):
     db_path = tmp_path / "test.db"
-    with patch.object(database, "DB_PATH", db_path):
+    with patch.object(database, "DEFAULT_DB_PATH", db_path):
         database.start_run("run-123")
         database.log_step("run-123", "1. Fetch emails", "success", "Fetched 5 emails")
         database.log_step("run-123", "2. Parse content", "success", "Parsed 3 articles")
@@ -73,7 +73,7 @@ def test_pipeline_run_logging(tmp_path):
 
 def test_list_runs(tmp_path):
     db_path = tmp_path / "test.db"
-    with patch.object(database, "DB_PATH", db_path):
+    with patch.object(database, "DEFAULT_DB_PATH", db_path):
         database.start_run("run-a")
         database.finish_run("run-a", "success")
         database.start_run("run-b")

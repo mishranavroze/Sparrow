@@ -7,7 +7,7 @@ from pathlib import Path
 
 from feedgen.feed import FeedGenerator
 
-from config import ShowConfig, settings
+from config import DEFAULT_SHOW_ID, ShowConfig, settings
 from src import database
 from src.exceptions import FeedBuildError
 from src.models import EpisodeMetadata
@@ -55,18 +55,12 @@ def _build_feed_generator(episodes: list[dict], show: ShowConfig | None = None) 
     fg = FeedGenerator()
     fg.load_extension("podcast")
 
-    title = show.podcast_title if show else settings.podcast_title
-    description = show.podcast_description if show else settings.podcast_description
-    show_id = show.show_id if show else "hootline"
+    title = show.podcast_title if show else "Podcast"
+    description = show.podcast_description if show else FALLBACK_RSS_DESCRIPTION
+    show_id = show.show_id if show else DEFAULT_SHOW_ID
 
-    # In legacy mode (output_dir == "output"), use root URLs for backward compat
-    is_legacy = show and show.output_dir == Path("output")
-    if is_legacy:
-        feed_url = f"{settings.base_url}/feed.xml"
-        episode_url_prefix = f"{settings.base_url}/episodes"
-    else:
-        feed_url = f"{settings.base_url}/{show_id}/feed.xml"
-        episode_url_prefix = f"{settings.base_url}/{show_id}/episodes"
+    feed_url = f"{settings.base_url}/{show_id}/feed.xml"
+    episode_url_prefix = f"{settings.base_url}/{show_id}/episodes"
 
     fg.title(title)
     fg.description(description)
@@ -75,11 +69,9 @@ def _build_feed_generator(episodes: list[dict], show: ShowConfig | None = None) 
     fg.language("en")
     fg.generator(f"{title} Podcast Generator")
 
-    # Channel-level image (standard RSS) — per-show icon
-    if show_id == "sparrow":
-        image_url = f"{settings.base_url}/static/noctua_owl.png"
-    else:
-        image_url = f"{settings.base_url}/static/noctua-owl.png"
+    # Channel-level image (standard RSS) — config-driven per-show icon
+    icon_filename = show.icon_filename if show else "noctua_owl.png"
+    image_url = f"{settings.base_url}/static/{icon_filename}"
 
     fg.image(
         url=image_url,

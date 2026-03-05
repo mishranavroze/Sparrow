@@ -24,11 +24,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 logger = logging.getLogger(__name__)
 
 
-async def generate_digest_only(show: ShowConfig | None = None) -> CompiledDigest | None:
+async def generate_digest_only(show: ShowConfig | None = None, save_to_db: bool = True) -> CompiledDigest | None:
     """Run steps 1-3 of the pipeline: fetch emails, parse, compile digest.
 
     Args:
         show: Show-specific config. When None, uses legacy defaults.
+        save_to_db: Whether to persist the compiled digest to the database.
+            Set to False when the caller wants to keep the digest in-memory only
+            (e.g. the preparation workflow).
 
     Returns:
         The compiled digest, or None if no emails/articles were found.
@@ -94,22 +97,24 @@ async def generate_digest_only(show: ShowConfig | None = None) -> CompiledDigest
                 database.finish_run(run_id, "success", db_path=db_path)
                 return compiled
 
-            database.save_digest(
-                date=compiled.date,
-                markdown_text=compiled.text,
-                article_count=compiled.article_count,
-                total_words=compiled.total_words,
-                topics_summary=compiled.topics_summary,
-                rss_summary=compiled.rss_summary,
-                email_count=compiled.email_count,
-                segment_counts=compiled.segment_counts,
-                segment_sources=compiled.segment_sources,
-                db_path=db_path,
-            )
+            if save_to_db:
+                database.save_digest(
+                    date=compiled.date,
+                    markdown_text=compiled.text,
+                    article_count=compiled.article_count,
+                    total_words=compiled.total_words,
+                    topics_summary=compiled.topics_summary,
+                    rss_summary=compiled.rss_summary,
+                    email_count=compiled.email_count,
+                    segment_counts=compiled.segment_counts,
+                    segment_sources=compiled.segment_sources,
+                    db_path=db_path,
+                )
 
+            saved_label = "saved to DB" if save_to_db else "in-memory only"
             msg = (
                 f"Compiled {compiled.article_count} articles, "
-                f"{compiled.total_words} words, saved to DB"
+                f"{compiled.total_words} words, {saved_label}"
             )
             logger.info(msg)
             database.log_step(run_id, "3. Compile digest", "success", msg, db_path=db_path)

@@ -9,7 +9,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-from config import ShowConfig, settings
+from config import LOCAL_TZ, ShowConfig, settings
 from src.exceptions import EmailFetchError
 from src.models import EmailMessage
 
@@ -102,24 +102,29 @@ def fetch_todays_emails(show: ShowConfig | None = None) -> list[EmailMessage]:
     service = _get_gmail_service(show)
     gmail_label = show.gmail_label if show else settings.gmail_label
 
-    PST = timezone(timedelta(hours=-8))
-    now_pst = datetime.now(PST)
-    today_pst = now_pst.date()
+    now_local = datetime.now(LOCAL_TZ)
+    today_local = now_local.date()
 
-    # Cutoff time in PST, derived from UTC generation schedule
-    cutoff_hour = (settings.generation_hour - 8) % 24
-    cutoff_min = settings.generation_minute
+    # Derive local cutoff time from the UTC generation schedule
+    cutoff_utc = datetime(
+        today_local.year, today_local.month, today_local.day,
+        hour=settings.generation_hour, minute=settings.generation_minute,
+        tzinfo=timezone.utc,
+    )
+    cutoff_local = cutoff_utc.astimezone(LOCAL_TZ)
+    cutoff_hour = cutoff_local.hour
+    cutoff_min = cutoff_local.minute
 
     # Today's cutoff
     cutoff_today = datetime(
-        today_pst.year, today_pst.month, today_pst.day,
-        hour=cutoff_hour, minute=cutoff_min, tzinfo=PST,
+        today_local.year, today_local.month, today_local.day,
+        hour=cutoff_hour, minute=cutoff_min, tzinfo=LOCAL_TZ,
     )
 
     # 24-hour window: previous cutoff → now
     start_boundary = cutoff_today - timedelta(days=1)
     after_epoch = int(start_boundary.timestamp())
-    before_epoch = int(now_pst.timestamp())
+    before_epoch = int(now_local.timestamp())
     query = f"after:{after_epoch} before:{before_epoch}"
     if gmail_label:
         query = f"label:{gmail_label} {query}"
