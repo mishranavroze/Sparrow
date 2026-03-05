@@ -45,5 +45,11 @@ token.json
 # Debug screenshots
 output/debug/
 
+# Archived show data
+output/_archived_*/
+
+# Replit attached assets (uploaded files)
+attached_assets/
+
 # Claude Code config
 .claude-user/

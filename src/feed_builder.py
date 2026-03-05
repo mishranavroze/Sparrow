@@ -81,10 +81,10 @@ def _build_feed_generator(episodes: list[dict], show: ShowConfig | None = None) 
 
     # Podcast-specific metadata
     fg.podcast.itunes_category("News", "Daily News")
-    fg.podcast.itunes_author("Aannesha Satpati")
+    fg.podcast.itunes_author("Navroze Mishra")
     fg.podcast.itunes_explicit("no")
     fg.podcast.itunes_summary(description)
-    fg.podcast.itunes_owner(name="Aannesha Satpati", email="aannesha.satpati@gmail.com")
+    fg.podcast.itunes_owner(name="Navroze Mishra", email="mishra.navroze@gmail.com")
     fg.podcast.itunes_image(image_url)
 
     # Add episodes (most recent first)
